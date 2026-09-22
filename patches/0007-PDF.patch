@@ -1,0 +1,769 @@
+From 5c738a7b6712c7377bc5fd4efde71b504d2a5c2b Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sat, 19 Sep 2026 14:59:18 +0800
+Subject: [PATCH 07/14] =?UTF-8?q?=E7=AC=AC=E4=B8=89=E6=89=B9=EF=BC=9APDF?=
+ =?UTF-8?q?=20=E6=94=AF=E6=8C=81=E6=8C=89=E9=A1=B5=E8=8C=83=E5=9B=B4?=
+ =?UTF-8?q?=E5=AF=BC=E5=87=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+导出条新增「PDF 选页」按钮，弹窗可填 1-based 闭区间的起止页，
+默认预填整本，带「当前页」「全部」快捷按钮，非法输入时禁用导出。
+
+- EditorExporter.pdfExportablePageCount / pdfPageRange 作为范围解析的
+  唯一真源（复刻 generatePdf 只去掉至多一个末尾空页的既有行为，
+  与 _generateText 去掉全部末尾空页的规则不同）
+- generatePdf 新增可选命名参数 firstPage/lastPage，先按范围裁出
+  pages 子列表再走原有函数体，截图与索引逻辑一行未改；
+  既有调用方（test/sbn_test.dart、export_note_button.dart）不受影响
+- 范围导出文件名带页码（笔记名_p3-7.pdf），整本导出保持原名不变
+- 空白笔记不再静默生成 0 页 PDF，改为提示没有可导出的页
+- 新增 test/pdf_page_range_test.dart（11 个纯逻辑 + 6 个弹窗用例）
+---
+ lib/components/toolbar/export_bar.dart        |  11 +
+ .../toolbar/pdf_page_range_dialog.dart        | 200 ++++++++++++
+ lib/components/toolbar/toolbar.dart           |   3 +
+ lib/data/editor/editor_exporter.dart          |  61 +++-
+ lib/pages/editor/editor.dart                  |  59 +++-
+ test/pdf_page_range_test.dart                 | 296 ++++++++++++++++++
+ 6 files changed, 619 insertions(+), 11 deletions(-)
+ create mode 100644 lib/components/toolbar/pdf_page_range_dialog.dart
+ create mode 100644 test/pdf_page_range_test.dart
+
+diff --git a/lib/components/toolbar/export_bar.dart b/lib/components/toolbar/export_bar.dart
+index 6d4583b4..45987b13 100644
+--- a/lib/components/toolbar/export_bar.dart
++++ b/lib/components/toolbar/export_bar.dart
+@@ -9,6 +9,7 @@ class ExportBar extends StatefulWidget {
+     required this.toggleExportBar,
+     required this.exportAsSba,
+     required this.exportAsPdf,
++    required this.exportAsPdfRange,
+     required this.exportAsPng,
+     required this.exportAsMarkdown,
+     required this.exportAsPlainText,
+@@ -20,6 +21,7 @@ class ExportBar extends StatefulWidget {
+ 
+   final Future Function(BuildContext)? exportAsSba;
+   final Future Function(BuildContext)? exportAsPdf;
++  final Future Function(BuildContext)? exportAsPdfRange;
+   final Future Function(BuildContext)? exportAsPng;
+   final Future Function(BuildContext)? exportAsMarkdown;
+   final Future Function(BuildContext)? exportAsPlainText;
+@@ -81,6 +83,15 @@ class _ExportBarState extends State<ExportBar> {
+           );
+         },
+       ),
++      // 个人自用版：未走 i18n
++      Builder(
++        builder: (context) {
++          return TextButton(
++            onPressed: _onPressed(widget.exportAsPdfRange, context),
++            child: _buttonChild(widget.exportAsPdfRange, 'PDF 选页'),
++          );
++        },
++      ),
+       Builder(
+         builder: (context) {
+           return TextButton(
+diff --git a/lib/components/toolbar/pdf_page_range_dialog.dart b/lib/components/toolbar/pdf_page_range_dialog.dart
+new file mode 100644
+index 00000000..4238f3bc
+--- /dev/null
++++ b/lib/components/toolbar/pdf_page_range_dialog.dart
+@@ -0,0 +1,200 @@
++import 'package:flutter/cupertino.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
++import 'package:saber/components/theming/adaptive_alert_dialog.dart';
++import 'package:saber/data/editor/editor_core_info.dart';
++import 'package:saber/data/editor/editor_exporter.dart';
++
++/// 个人自用版：导出 PDF 时选择页码范围（1-based 闭区间）的弹窗。
++///
++/// Asks for a first and a last page number, validates them against the number
++/// of pages [EditorExporter.generatePdf] would actually export, and returns the
++/// chosen range. Returns null if the user cancels.
++class PdfPageRangeDialog extends StatefulWidget {
++  const new({super.key, required this.coreInfo, required this.currentPage});
++
++  final EditorCoreInfo coreInfo;
++
++  /// The 1-based page number currently centred on screen, used by the
++  /// "current page" shortcut. May point past the last exportable page, because
++  /// Saber keeps a blank page at the end of every note.
++  final int currentPage;
++
++  /// Returns the chosen range, or null if the user cancelled.
++  static Future<({int first, int last})?> show(
++    BuildContext context, {
++    required EditorCoreInfo coreInfo,
++    required int currentPage,
++  }) {
++    return showDialog<({int first, int last})>(
++      context: context,
++      builder: (context) => PdfPageRangeDialog(
++        coreInfo: coreInfo,
++        currentPage: currentPage,
++      ),
++    );
++  }
++
++  @override
++  State<PdfPageRangeDialog> createState() => _PdfPageRangeDialogState();
++}
++
++class _PdfPageRangeDialogState extends State<PdfPageRangeDialog> {
++  /// The number of pages that can be exported: the blank page at the end of
++  /// the note doesn't count, matching [EditorExporter.generatePdf].
++  late final int pageCount;
++
++  late final TextEditingController _firstController;
++  late final TextEditingController _lastController;
++
++  @override
++  void initState() {
++    super.initState();
++    pageCount = EditorExporter.pdfExportablePageCount(widget.coreInfo);
++    // default to the whole range, so just pressing "export" does what the
++    // plain PDF button does
++    _firstController = TextEditingController(text: '1');
++    _lastController = TextEditingController(text: '$pageCount');
++  }
++
++  @override
++  void dispose() {
++    _firstController.dispose();
++    _lastController.dispose();
++    super.dispose();
++  }
++
++  /// 个人自用版：未走 i18n
++  String? get _error {
++    if (pageCount <= 0) return null;
++
++    final first = int.tryParse(_firstController.text);
++    final last = int.tryParse(_lastController.text);
++    if (first == null || last == null) return '请输入页码';
++
++    if (first < 1 || last < 1 || first > pageCount || last > pageCount) {
++      return '页码范围 1–$pageCount';
++    }
++
++    if (first > last) return '起始页不能大于结束页';
++
++    return null;
++  }
++
++  void _submit() {
++    final error = _error;
++    if (error != null) return;
++
++    final first = int.tryParse(_firstController.text);
++    final last = int.tryParse(_lastController.text);
++    if (first == null || last == null) return;
++
++    Navigator.pop(context, (first: first, last: last));
++  }
++
++  void _useCurrentPage() {
++    final page = widget.currentPage.clamp(1, pageCount).toInt();
++    setState(() {
++      _firstController.text = '$page';
++      _lastController.text = '$page';
++    });
++  }
++
++  void _useAllPages() {
++    setState(() {
++      _firstController.text = '1';
++      _lastController.text = '$pageCount';
++    });
++  }
++
++  Widget _pageField(TextEditingController controller, String label) {
++    return TextField(
++      controller: controller,
++      keyboardType: TextInputType.number,
++      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
++      decoration: InputDecoration(labelText: label),
++      onChanged: (_) => setState(() {}),
++      onSubmitted: (_) => _submit(),
++    );
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    if (pageCount <= 0) {
++      return AdaptiveAlertDialog(
++        // 个人自用版：未走 i18n
++        title: const Text('导出 PDF 选页'),
++        // 个人自用版：未走 i18n
++        content: const Text('这本笔记没有可导出的页。'),
++        actions: [
++          CupertinoDialogAction(
++            onPressed: () => Navigator.pop(context),
++            // 个人自用版：未走 i18n
++            child: const Text('关闭'),
++          ),
++        ],
++      );
++    }
++
++    final error = _error;
++
++    return AdaptiveAlertDialog(
++      // 个人自用版：未走 i18n
++      title: const Text('导出 PDF 选页'),
++      content: SizedBox(
++        width: 320,
++        child: Column(
++          mainAxisSize: .min,
++          crossAxisAlignment: .start,
++          children: [
++            // 个人自用版：未走 i18n
++            Text('共 $pageCount 页（末尾空白页不计）'),
++            const SizedBox.square(dimension: 12),
++            Row(
++              children: [
++                // 个人自用版：未走 i18n
++                Expanded(child: _pageField(_firstController, '起始页')),
++                // 个人自用版：未走 i18n
++                const Padding(
++                  padding: EdgeInsets.symmetric(horizontal: 8),
++                  child: Text('到'),
++                ),
++                // 个人自用版：未走 i18n
++                Expanded(child: _pageField(_lastController, '结束页')),
++              ],
++            ),
++            Row(
++              children: [
++                TextButton(
++                  onPressed: _useCurrentPage,
++                  // 个人自用版：未走 i18n
++                  child: const Text('当前页'),
++                ),
++                TextButton(
++                  onPressed: _useAllPages,
++                  // 个人自用版：未走 i18n
++                  child: const Text('全部'),
++                ),
++              ],
++            ),
++            if (error != null)
++              Text(error, style: TextStyle(color: ColorScheme.of(context).error)),
++          ],
++        ),
++      ),
++      actions: [
++        CupertinoDialogAction(
++          onPressed: () => Navigator.pop(context),
++          // 个人自用版：未走 i18n
++          child: const Text('取消'),
++        ),
++        CupertinoDialogAction(
++          // disabled (onPressed == null) while the range is invalid
++          onPressed: error == null ? _submit : null,
++          // 个人自用版：未走 i18n
++          child: const Text('导出'),
++        ),
++      ],
++    );
++  }
++}
+diff --git a/lib/components/toolbar/toolbar.dart b/lib/components/toolbar/toolbar.dart
+index 0d8ea9d1..294d402e 100644
+--- a/lib/components/toolbar/toolbar.dart
++++ b/lib/components/toolbar/toolbar.dart
+@@ -49,6 +49,7 @@ class Toolbar extends StatefulWidget {
+     required this.deleteSelection,
+     required this.exportAsSba,
+     required this.exportAsPdf,
++    required this.exportAsPdfRange,
+     required this.exportAsPng,
+     required this.exportAsMarkdown,
+     required this.exportAsPlainText,
+@@ -79,6 +80,7 @@ class Toolbar extends StatefulWidget {
+ 
+   final Future Function(BuildContext)? exportAsSba;
+   final Future Function(BuildContext)? exportAsPdf;
++  final Future Function(BuildContext)? exportAsPdfRange;
+   final Future Function(BuildContext)? exportAsPng;
+   final Future Function(BuildContext)? exportAsMarkdown;
+   final Future Function(BuildContext)? exportAsPlainText;
+@@ -212,6 +214,7 @@ class _ToolbarState extends State<Toolbar> {
+           toggleExportBar: toggleExportBar,
+           exportAsSba: widget.exportAsSba,
+           exportAsPdf: widget.exportAsPdf,
++          exportAsPdfRange: widget.exportAsPdfRange,
+           exportAsPng: widget.exportAsPng,
+           exportAsMarkdown: widget.exportAsMarkdown,
+           exportAsPlainText: widget.exportAsPlainText,
+diff --git a/lib/data/editor/editor_exporter.dart b/lib/data/editor/editor_exporter.dart
+index 9cb94d8f..1e071e42 100644
+--- a/lib/data/editor/editor_exporter.dart
++++ b/lib/data/editor/editor_exporter.dart
+@@ -101,17 +101,68 @@ abstract class EditorExporter {
+     return '${out.toString().trimRight()}\n';
+   }
+ 
++  /// 个人自用版：PDF 导出实际会包含的页数。
++  ///
++  /// 复刻 [generatePdf] 一直以来的行为：末尾那一页空白页不计入
++  /// （Saber 会一直留一页空白供书写）。
++  static int pdfExportablePageCount(EditorCoreInfo coreInfo) {
++    final pages = coreInfo.pages;
++    if (pages.isEmpty) return 0;
++    return pages.last.isEmpty ? pages.length - 1 : pages.length;
++  }
++
++  /// 个人自用版：把 1-based 的页范围夹到可导出范围内。
++  ///
++  /// [firstPage] / [lastPage] 是 1-based 闭区间，null 表示"第一页 / 最后一页"。
++  /// 笔记没有可导出的页、或 [firstPage] > [lastPage] 时返回 null。
++  static ({int first, int last})? pdfPageRange(
++    EditorCoreInfo coreInfo, {
++    int? firstPage,
++    int? lastPage,
++  }) {
++    final pageCount = pdfExportablePageCount(coreInfo);
++    if (pageCount <= 0) return null;
++    // num.clamp returns num, so the toInt() is required here
++    final first = (firstPage ?? 1).clamp(1, pageCount).toInt();
++    final last = (lastPage ?? pageCount).clamp(1, pageCount).toInt();
++    if (first > last) return null;
++    return (first: first, last: last);
++  }
++
++  /// Generates a PDF of the note.
++  ///
++  /// 个人自用版：把 [firstPage] / [lastPage]（1-based 闭区间）传进来即可只导出
++  /// 其中几页；两个都省略时导出全部页，与改动前的行为完全一致。
+   static Future<pw.Document> generatePdf(
+     EditorCoreInfo coreInfo,
+-    BuildContext context,
+-  ) async {
+-    if (coreInfo.pages.isNotEmpty && coreInfo.pages.last.isEmpty) {
++    BuildContext context, {
++    int? firstPage,
++    int? lastPage,
++  }) async {
++    var pages = coreInfo.pages.toList();
++    if (pages.isNotEmpty && pages.last.isEmpty) {
+       // don't export the empty last page
+-      coreInfo = coreInfo.copyWith(
+-        pages: coreInfo.pages.toList()..removeLast(),
++      pages.removeLast();
++    }
++
++    if (firstPage != null || lastPage != null) {
++      final range = pdfPageRange(
++        coreInfo,
++        firstPage: firstPage,
++        lastPage: lastPage,
+       );
++      if (range == null) {
++        // unreachable: the page range dialog only lets valid ranges through
++        throw ArgumentError(
++          'Invalid PDF page range: $firstPage..$lastPage (${pages.length} pages)',
++        );
++      }
++      // 1-based inclusive -> 0-based half-open
++      pages = pages.sublist(range.first - 1, range.last);
+     }
+ 
++    coreInfo = coreInfo.copyWith(pages: pages);
++
+     final pdf = pw.Document();
+ 
+     // screenshot each page
+diff --git a/lib/pages/editor/editor.dart b/lib/pages/editor/editor.dart
+index e565ec67..2979b95c 100644
+--- a/lib/pages/editor/editor.dart
++++ b/lib/pages/editor/editor.dart
+@@ -32,6 +32,7 @@ import 'package:saber/components/theming/saber_theme.dart';
+ import 'package:saber/components/toolbar/color_bar.dart';
+ import 'package:saber/components/toolbar/editor_bottom_sheet.dart';
+ import 'package:saber/components/toolbar/editor_page_manager.dart';
++import 'package:saber/components/toolbar/pdf_page_range_dialog.dart';
+ import 'package:saber/components/toolbar/toolbar.dart';
+ import 'package:saber/data/editor/editor_core_info.dart';
+ import 'package:saber/data/editor/editor_exporter.dart';
+@@ -1298,14 +1299,59 @@ class EditorState extends State<Editor> {
+   // does not affect Android. Text pasting is still handled natively by the
+   // Quill text field.
+ 
+-  Future exportAsPdf(BuildContext context) async {
+-    final pdf = await EditorExporter.generatePdf(coreInfo, context);
++  /// 个人自用版：导出 PDF，可选只导出 [firstPage]..[lastPage]（1-based 闭区间）。
++  Future exportAsPdf(
++    BuildContext context, {
++    int? firstPage,
++    int? lastPage,
++  }) async {
++    // 个人自用版：空白笔记会导出一个 0 页的 PDF，不如直接说清楚
++    if (EditorExporter.pdfExportablePageCount(coreInfo) == 0) {
++      ScaffoldMessenger.of(context).showSnackBar(
++        // 个人自用版：未走 i18n
++        const SnackBar(content: Text('本笔记没有可导出的页')),
++      );
++      return;
++    }
++
++    final pdf = await EditorExporter.generatePdf(
++      coreInfo,
++      context,
++      firstPage: firstPage,
++      lastPage: lastPage,
++    );
+     final bytes = await pdf.save();
+     if (!context.mounted) return;
+-    await FileManager.exportFile(
+-      '${coreInfo.fileName}.pdf',
+-      bytes,
+-      context: context,
++
++    // 个人自用版：范围导出把页码写进文件名，导出多次才不会混在一起
++    final range = (firstPage == null && lastPage == null)
++        ? null
++        : EditorExporter.pdfPageRange(
++            coreInfo,
++            firstPage: firstPage,
++            lastPage: lastPage,
++          );
++    final fileName = range == null
++        ? '${coreInfo.fileName}.pdf'
++        : '${coreInfo.fileName}_p${range.first}-${range.last}.pdf';
++
++    await FileManager.exportFile(fileName, bytes, context: context);
++  }
++
++  /// 个人自用版：先让用户选页码范围，再导出 PDF。
++  Future exportAsPdfRange(BuildContext context) async {
++    final range = await PdfPageRangeDialog.show(
++      context,
++      coreInfo: coreInfo,
++      currentPage: currentPageIndex + 1,
++    );
++    if (range == null) return;
++    if (!context.mounted) return;
++
++    await exportAsPdf(
++      context,
++      firstPage: range.first,
++      lastPage: range.last,
+     );
+   }
+ 
+@@ -1601,6 +1647,7 @@ class EditorState extends State<Editor> {
+           pickPhoto: _pickPhotos,
+           exportAsSba: exportAsSba,
+           exportAsPdf: exportAsPdf,
++          exportAsPdfRange: exportAsPdfRange,
+           exportAsPng: exportAsPng,
+           exportAsMarkdown: exportAsMarkdown,
+           exportAsPlainText: exportAsPlainText,
+diff --git a/test/pdf_page_range_test.dart b/test/pdf_page_range_test.dart
+new file mode 100644
+index 00000000..10be860e
+--- /dev/null
++++ b/test/pdf_page_range_test.dart
+@@ -0,0 +1,296 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:perfect_freehand/perfect_freehand.dart';
++import 'package:saber/components/canvas/_stroke.dart';
++import 'package:saber/components/toolbar/pdf_page_range_dialog.dart';
++import 'package:saber/data/editor/editor_core_info.dart';
++import 'package:saber/data/editor/editor_exporter.dart';
++import 'package:saber/data/editor/page.dart';
++
++void main() {
++  group('pdfExportablePageCount', () {
++    test('a blank note has no exportable page', () {
++      expect(EditorExporter.pdfExportablePageCount(_coreInfo([false])), 0);
++      expect(EditorExporter.pdfExportablePageCount(_coreInfo([])), 0);
++    });
++
++    test('the trailing blank page is left out', () {
++      expect(EditorExporter.pdfExportablePageCount(_coreInfo([true, false])), 1);
++      expect(
++        EditorExporter.pdfExportablePageCount(_coreInfo([true, true, false])),
++        2,
++      );
++    });
++
++    test('blank pages in the middle are still exported', () {
++      // only the *last* page is left out, matching EditorExporter.generatePdf
++      expect(
++        EditorExporter.pdfExportablePageCount(_coreInfo([true, false, true])),
++        3,
++      );
++      expect(
++        EditorExporter.pdfExportablePageCount(
++          _coreInfo([true, false, true, false]),
++        ),
++        3,
++      );
++    });
++  });
++
++  group('pdfPageRange', () {
++    test('defaults to the whole note', () {
++      final coreInfo = _coreInfo([true, true, true, false]);
++      expect(EditorExporter.pdfPageRange(coreInfo), (first: 1, last: 3));
++    });
++
++    test('first page only and last page only', () {
++      final coreInfo = _coreInfo([true, true, true, false]);
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: 2),
++        (first: 2, last: 3),
++      );
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, lastPage: 2),
++        (first: 1, last: 2),
++      );
++    });
++
++    test('an inner range is kept as-is', () {
++      final coreInfo = _coreInfo([true, true, true, true, true, false]);
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: 2, lastPage: 4),
++        (first: 2, last: 4),
++      );
++    });
++
++    test('out of range values are clamped', () {
++      final coreInfo = _coreInfo([true, true, true, false]);
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: -5, lastPage: 99),
++        (first: 1, last: 3),
++      );
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: 0, lastPage: 0),
++        (first: 1, last: 1),
++      );
++    });
++
++    test('a reversed range is invalid', () {
++      final coreInfo = _coreInfo([true, true, true, false]);
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: 3, lastPage: 1),
++        isNull,
++      );
++    });
++
++    test('a single page note can export its only page', () {
++      final coreInfo = _coreInfo([true, false]);
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: 1, lastPage: 1),
++        (first: 1, last: 1),
++      );
++    });
++
++    test('the trailing blank page is never selectable', () {
++      // 2 exportable pages, plus the blank one Saber appends
++      final coreInfo = _coreInfo([true, true, false]);
++      expect(EditorExporter.pdfPageRange(coreInfo, lastPage: 99)?.last, 2);
++      expect(
++        EditorExporter.pdfPageRange(coreInfo, firstPage: 3, lastPage: 3),
++        (first: 2, last: 2),
++      );
++    });
++
++    test('a note with nothing to export has no range', () {
++      expect(EditorExporter.pdfPageRange(_coreInfo([false])), isNull);
++      expect(EditorExporter.pdfPageRange(_coreInfo([])), isNull);
++    });
++  });
++
++  group('PdfPageRangeDialog', () {
++    testWidgets('defaults to the whole note and returns it', (tester) async {
++      final result = await _openDialog(
++        tester,
++        _coreInfo([true, true, true, false]),
++        currentPage: 1,
++      );
++
++      expect(find.text('共 3 页（末尾空白页不计）'), findsOneWidget);
++
++      await tester.tap(_exportButton);
++      await tester.pumpAndSettle();
++
++      expect(result.range, (first: 1, last: 3));
++    });
++
++    testWidgets('rejects a reversed range until it is fixed', (tester) async {
++      final result = await _openDialog(
++        tester,
++        _coreInfo([true, true, true, false]),
++        currentPage: 1,
++      );
++
++      await _enterRange(tester, first: '3', last: '1');
++      expect(find.text('起始页不能大于结束页'), findsOneWidget);
++      expect(tester.widget<TextButton>(_exportButton).onPressed, isNull);
++
++      await _enterRange(tester, first: '3', last: '3');
++      expect(find.text('起始页不能大于结束页'), findsNothing);
++      expect(tester.widget<TextButton>(_exportButton).onPressed, isNotNull);
++
++      await tester.tap(_exportButton);
++      await tester.pumpAndSettle();
++
++      expect(result.range, (first: 3, last: 3));
++    });
++
++    testWidgets('rejects pages outside the note', (tester) async {
++      final result = await _openDialog(
++        tester,
++        _coreInfo([true, true, true, false]),
++        currentPage: 1,
++      );
++
++      await _enterRange(tester, first: '1', last: '99');
++      expect(find.text('页码范围 1–3'), findsOneWidget);
++      expect(tester.widget<TextButton>(_exportButton).onPressed, isNull);
++
++      await _enterRange(tester, first: '', last: '2');
++      expect(find.text('请输入页码'), findsOneWidget);
++      expect(tester.widget<TextButton>(_exportButton).onPressed, isNull);
++
++      await tester.tap(find.widgetWithText(TextButton, '取消'));
++      await tester.pumpAndSettle();
++      expect(result.range, isNull);
++    });
++
++    testWidgets('the shortcuts fill in the current page and the whole note', (
++      tester,
++    ) async {
++      final result = await _openDialog(
++        tester,
++        _coreInfo([true, true, true, false]),
++        currentPage: 2,
++      );
++
++      await tester.tap(find.widgetWithText(TextButton, '当前页'));
++      await tester.pump();
++      await tester.tap(_exportButton);
++      await tester.pumpAndSettle();
++      expect(result.range, (first: 2, last: 2));
++
++      // 全部 restores the default
++      await tester.tap(find.text('open'));
++      await tester.pumpAndSettle();
++      await tester.tap(find.widgetWithText(TextButton, '全部'));
++      await tester.pump();
++      await tester.tap(_exportButton);
++      await tester.pumpAndSettle();
++      expect(result.range, (first: 1, last: 3));
++    });
++
++    testWidgets('clamps the current page shortcut to the last exportable page', (
++      tester,
++    ) async {
++      // the blank page at the end is on screen, so currentPage points past it
++      final result = await _openDialog(
++        tester,
++        _coreInfo([true, true, false]),
++        currentPage: 3,
++      );
++
++      await tester.tap(find.widgetWithText(TextButton, '当前页'));
++      await tester.pump();
++      await tester.tap(_exportButton);
++      await tester.pumpAndSettle();
++
++      expect(result.range, (first: 2, last: 2));
++    });
++
++    testWidgets('a blank note cannot export anything', (tester) async {
++      final result = await _openDialog(
++        tester,
++        _coreInfo([false]),
++        currentPage: 1,
++      );
++
++      expect(find.text('这本笔记没有可导出的页。'), findsOneWidget);
++      expect(find.widgetWithText(TextButton, '导出'), findsNothing);
++
++      await tester.tap(find.widgetWithText(TextButton, '关闭'));
++      await tester.pumpAndSettle();
++      expect(result.range, isNull);
++    });
++  });
++}
++
++/// The dialog's confirm button.
++Finder get _exportButton => find.widgetWithText(TextButton, '导出');
++
++Future<void> _enterRange(
++  WidgetTester tester, {
++  required String first,
++  required String last,
++}) async {
++  await tester.enterText(find.byType(TextField).at(0), first);
++  await tester.enterText(find.byType(TextField).at(1), last);
++  await tester.pump();
++}
++
++/// Opens [PdfPageRangeDialog] through a button, and returns a holder that gets
++/// filled in once the dialog closes.
++Future<_DialogResult> _openDialog(
++  WidgetTester tester,
++  EditorCoreInfo coreInfo, {
++  required int currentPage,
++}) async {
++  final result = _DialogResult();
++  await tester.pumpWidget(
++    MaterialApp(
++      home: Scaffold(
++        body: Builder(
++          builder: (context) => TextButton(
++            onPressed: () async {
++              result.range = await PdfPageRangeDialog.show(
++                context,
++                coreInfo: coreInfo,
++                currentPage: currentPage,
++              );
++            },
++            child: const Text('open'),
++          ),
++        ),
++      ),
++    ),
++  );
++
++  await tester.tap(find.text('open'));
++  await tester.pumpAndSettle();
++  return result;
++}
++
++class _DialogResult {
++  ({int first, int last})? range;
++}
++
++/// Builds a note with one page per entry of [hasContent]; `false` means blank.
++EditorCoreInfo _coreInfo(List<bool> hasContent) {
++  final coreInfo = EditorCoreInfo(filePath: '/Notes/Test');
++  for (var pageIndex = 0; pageIndex < hasContent.length; pageIndex++) {
++    final page = EditorPage();
++    if (hasContent[pageIndex]) {
++      page.strokes.add(
++        Stroke(
++          color: Colors.black,
++          pressureEnabled: false,
++          options: StrokeOptions(size: 5),
++          pageIndex: pageIndex,
++          page: page,
++          toolId: .fountainPen,
++        ),
++      );
++    }
++    coreInfo.pages.add(page);
++  }
++  return coreInfo;
++}

@@ -1,0 +1,3345 @@
+From 08f8f8e2946e450d57793f4748460a5485264c2c Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Fri, 18 Sep 2026 23:08:15 +0800
+Subject: [PATCH 02/14] =?UTF-8?q?feat:=20=E4=B8=AA=E4=BA=BA=E8=87=AA?=
+ =?UTF-8?q?=E7=94=A8=E7=89=88=E6=96=B0=E5=A2=9E=207=20=E4=B8=AA=E5=8A=9F?=
+ =?UTF-8?q?=E8=83=BD=20+=20=E7=A7=BB=E9=99=A4=20super=5Fclipboard?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+新增功能（flutter analyze: No issues found）：
+- 全局全文搜索：主页放大镜/设置入口，标题即时过滤 + 正文增量扫描
+  （自写轻量 bson 只取 Quill delta 文本，worker_manager isolate 中跑，可取消）
+- 笔记收藏/置顶：卡片右上角图钉，置顶项排在最近笔记最前
+- 笔记回收站（软删除）：回收站位于笔记根目录之外的 .saber-trash，
+  支持恢复/彻底删除/清空，资产文件随笔记进出
+- 快速捕获：主页日历图标直达 /每日笔记/yy-MM-dd
+- 导出 Markdown / 纯文本：工具栏分享条新增两个按钮，自写 Delta→Markdown 转换器
+- 笔记信息面板：编辑器底部面板显示页数/笔画数/图片数/字数/文件大小/格式版本
+- 自定义笔预设：笔弹出面板可保存并一键套用最多 3 组笔参数
+
+其他改动：
+- 移除 super_clipboard：其 Rust build hook 需要 rustup 工具链，而它唯一的
+  用途（剪贴板粘贴图片）只挂在桌面 Ctrl+V 快捷键上，Android 无入口。
+  移除后依赖链（super_native_extensions/irondash_engine_context）一并消失，
+  构建不再需要 Rust。文本粘贴仍由 Quill 原生处理。
+- 构建文件加国内镜像（android/settings.gradle.kts、android/build.gradle.kts），
+  并把 mavenCentral() 排在 google() 之前，避免探测不通的 dl.google.com。
+
+产物：build/app/outputs/flutter-apk/app-release.apk（108.2 MB，含
+arm64-v8a/armeabi-v7a/x86_64 三个 ABI），已另存于
+E:\\dev\\output\\Saber-custom-v1.36.1.apk
+SHA-256: 0c2184d3bdd1652ed2fd701862e5eb21893db477e3227a59c6eeda8e266d3df9
+---
+ android/build.gradle.kts                      |   6 +-
+ lib/components/home/daily_note_button.dart    |  48 +++
+ lib/components/home/delete_note_button.dart   |  29 +-
+ lib/components/home/pin_button.dart           |  46 +++
+ lib/components/home/preview_card.dart         |   7 +
+ .../toolbar/editor_bottom_sheet.dart          |   4 +
+ .../toolbar/editor_info_section.dart          | 160 ++++++++
+ lib/components/toolbar/export_bar.dart        |  22 +
+ lib/components/toolbar/pen_modal.dart         |  19 +-
+ lib/components/toolbar/pen_presets_bar.dart   | 256 ++++++++++++
+ lib/components/toolbar/toolbar.dart           |  15 +-
+ lib/data/editor/editor_exporter.dart          |  73 ++++
+ lib/data/editor/quill_to_markdown.dart        | 184 +++++++++
+ lib/data/file_manager/file_manager.dart       | 327 ++++++++++++++-
+ lib/data/file_manager/note_search.dart        | 115 ++++++
+ lib/data/file_manager/pinned_notes.dart       |  74 ++++
+ lib/data/prefs.dart                           |  17 +
+ lib/data/routes.dart                          |  22 +
+ lib/data/tools/pen_presets.dart               | 246 +++++++++++
+ lib/main.dart                                 |   2 +
+ lib/pages/editor/editor.dart                  |  87 ++--
+ lib/pages/home/recent_notes.dart              |  40 +-
+ lib/pages/home/search.dart                    | 387 ++++++++++++++++++
+ lib/pages/home/settings.dart                  |  13 +
+ lib/pages/home/trash.dart                     | 181 ++++++++
+ linux/flutter/generated_plugin_registrant.cc  |   8 -
+ linux/flutter/generated_plugins.cmake         |   2 -
+ macos/Flutter/GeneratedPluginRegistrant.swift |   4 -
+ pubspec.lock                                  |  40 --
+ pubspec.yaml                                  |   2 -
+ test/editor_text_export_test.dart             | 139 +++++++
+ test/pen_presets_test.dart                    |  67 +++
+ .../flutter/generated_plugin_registrant.cc    |   6 -
+ windows/flutter/generated_plugins.cmake       |   2 -
+ 34 files changed, 2498 insertions(+), 152 deletions(-)
+ create mode 100644 lib/components/home/daily_note_button.dart
+ create mode 100644 lib/components/home/pin_button.dart
+ create mode 100644 lib/components/toolbar/editor_info_section.dart
+ create mode 100644 lib/components/toolbar/pen_presets_bar.dart
+ create mode 100644 lib/data/editor/quill_to_markdown.dart
+ create mode 100644 lib/data/file_manager/note_search.dart
+ create mode 100644 lib/data/file_manager/pinned_notes.dart
+ create mode 100644 lib/data/tools/pen_presets.dart
+ create mode 100644 lib/pages/home/search.dart
+ create mode 100644 lib/pages/home/trash.dart
+ create mode 100644 test/editor_text_export_test.dart
+ create mode 100644 test/pen_presets_test.dart
+
+diff --git a/android/build.gradle.kts b/android/build.gradle.kts
+index e586625d..9817d819 100644
+--- a/android/build.gradle.kts
++++ b/android/build.gradle.kts
+@@ -4,8 +4,12 @@ allprojects {
+         // the original repositories stay as fallbacks.
+         maven("https://maven.aliyun.com/repository/google")
+         maven("https://maven.aliyun.com/repository/public")
+-        google()
++        // mavenCentral() is listed before google() on purpose: artifacts that
++        // the Aliyun mirrors lack are almost always Maven Central artifacts,
++        // so this avoids probing dl.google.com for them (that host is
++        // unreachable on some networks, and a probe there can hang).
+         mavenCentral()
++        google()
+         maven("https://jitpack.io")
+         maven("http://repo.boox.com/repository/maven-public/") {
+             isAllowInsecureProtocol = true
+diff --git a/lib/components/home/daily_note_button.dart b/lib/components/home/daily_note_button.dart
+new file mode 100644
+index 00000000..2b74c947
+--- /dev/null
++++ b/lib/components/home/daily_note_button.dart
+@@ -0,0 +1,48 @@
++import 'package:flutter/material.dart';
++import 'package:go_router/go_router.dart';
++import 'package:intl/intl.dart';
++import 'package:saber/data/file_manager/file_manager.dart';
++import 'package:saber/data/routes.dart';
++import 'package:saber/pages/editor/editor.dart';
++
++/// 个人自用版：一键进入今天的每日笔记（未走 i18n，文案直接使用中文字面量）。
++///
++/// If today's note doesn't exist yet, the editor creates it on first save, just
++/// like the existing "new note" button does.
++class const DailyNoteButton({super.key}) extends StatelessWidget {
++  /// 个人自用版：每日笔记存放的文件夹。
++  static const folderName = '每日笔记';
++
++  static final dateFormat = DateFormat('yy-MM-dd');
++
++  /// The relative path (without extension) of today's note.
++  static String todayNotePath([DateTime? now]) {
++    final date = dateFormat.format(now ?? DateTime.now());
++    return '/$folderName/$date';
++  }
++
++  /// Opens today's note, creating its folder if the note doesn't exist yet.
++  static Future<void> openDailyNote(BuildContext context) async {
++    final filePath = todayNotePath();
++
++    final alreadyExists =
++        FileManager.doesFileExist('$filePath${Editor.extension}') ||
++        FileManager.doesFileExist('$filePath${Editor.extensionOldJson}');
++    if (!alreadyExists) {
++      await FileManager.createFolder('/$folderName');
++      if (!context.mounted) return;
++    }
++
++    context.push(RoutePaths.editFilePath(filePath));
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return IconButton(
++      // 个人自用版：未走 i18n
++      tooltip: '今天的每日笔记',
++      onPressed: () => openDailyNote(context),
++      icon: const Icon(Icons.today),
++    );
++  }
++}
+diff --git a/lib/components/home/delete_note_button.dart b/lib/components/home/delete_note_button.dart
+index 9396db60..799d2e3a 100644
+--- a/lib/components/home/delete_note_button.dart
++++ b/lib/components/home/delete_note_button.dart
+@@ -66,13 +66,28 @@ class _DeleteNoteDialogState extends State<_DeleteNoteDialog> {
+                 n: widget.filesToDelete.length,
+               ),
+             ),
+-      content: CheckboxListTile.adaptive(
+-        value: deleteAllowed,
+-        onChanged: (value) => setState(() => deleteAllowed = value!),
+-        controlAffinity: .leading,
+-        title: Text(
+-          t.home.deleteNoteDialog.confirmDelete(n: widget.filesToDelete.length),
+-        ),
++      content: Column(
++        mainAxisSize: .min,
++        children: [
++          CheckboxListTile.adaptive(
++            value: deleteAllowed,
++            onChanged: (value) => setState(() => deleteAllowed = value!),
++            controlAffinity: .leading,
++            title: Text(
++              t.home.deleteNoteDialog.confirmDelete(
++                n: widget.filesToDelete.length,
++              ),
++            ),
++          ),
++          // 个人自用版：删除会先移入回收站（未走 i18n）
++          Padding(
++            padding: const .only(left: 8, right: 8, bottom: 8),
++            child: Text(
++              '笔记会先移入回收站，可在「设置 → 回收站」中恢复或彻底删除。',
++              style: TextTheme.of(context).bodySmall,
++            ),
++          ),
++        ],
+       ),
+       actions: [
+         CupertinoDialogAction(
+diff --git a/lib/components/home/pin_button.dart b/lib/components/home/pin_button.dart
+new file mode 100644
+index 00000000..e5027bfb
+--- /dev/null
++++ b/lib/components/home/pin_button.dart
+@@ -0,0 +1,46 @@
++import 'package:flutter/material.dart';
++import 'package:saber/data/file_manager/pinned_notes.dart';
++import 'package:saber/data/prefs.dart';
++
++/// 个人自用版：笔记卡片角上的置顶/取消置顶按钮（未走 i18n）。
++class PinButton extends StatelessWidget {
++  const new({super.key, required this.filePath});
++
++  /// The note's path, without its extension.
++  final String filePath;
++
++  @override
++  Widget build(BuildContext context) {
++    return ValueListenableBuilder(
++      valueListenable: stows.pinnedFiles,
++      builder: (context, _, _) {
++        final isPinned = PinnedNotes.isPinned(filePath);
++        final colorScheme = ColorScheme.of(context);
++
++        return Tooltip(
++          message: isPinned ? '取消置顶' : '置顶笔记', // 个人自用版：未走 i18n
++          child: Material(
++            color: isPinned
++                ? colorScheme.primaryContainer
++                : colorScheme.surface.withValues(alpha: 0.7),
++            shape: const CircleBorder(),
++            clipBehavior: .antiAlias,
++            child: InkWell(
++              onTap: () => PinnedNotes.setPinned(filePath, pinned: !isPinned),
++              child: Padding(
++                padding: const .all(4),
++                child: Icon(
++                  isPinned ? Icons.push_pin : Icons.push_pin_outlined,
++                  size: 18,
++                  color: isPinned
++                      ? colorScheme.onPrimaryContainer
++                      : colorScheme.onSurfaceVariant,
++                ),
++              ),
++            ),
++          ),
++        );
++      },
++    );
++  }
++}
+diff --git a/lib/components/home/preview_card.dart b/lib/components/home/preview_card.dart
+index 42eb7e7b..927c98ae 100644
+--- a/lib/components/home/preview_card.dart
++++ b/lib/components/home/preview_card.dart
+@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
+ import 'package:saber/components/canvas/_stroke.dart';
+ import 'package:saber/components/canvas/inner_canvas.dart';
+ import 'package:saber/components/canvas/invert_widget.dart';
++import 'package:saber/components/home/pin_button.dart';
+ import 'package:saber/data/extensions/color_extensions.dart';
+ import 'package:saber/data/file_manager/file_manager.dart';
+ import 'package:saber/data/is_this_a_test.dart';
+@@ -198,6 +199,12 @@ class _PreviewCardState extends State<PreviewCard> {
+                       ),
+                     ),
+                   ),
++                  // 个人自用版：置顶/取消置顶角标按钮（未走 i18n）
++                  Positioned(
++                    top: 4,
++                    right: 4,
++                    child: PinButton(filePath: widget.filePath),
++                  ),
+                 ],
+               ),
+             ),
+diff --git a/lib/components/toolbar/editor_bottom_sheet.dart b/lib/components/toolbar/editor_bottom_sheet.dart
+index 12afb6c6..c149e671 100644
+--- a/lib/components/toolbar/editor_bottom_sheet.dart
++++ b/lib/components/toolbar/editor_bottom_sheet.dart
+@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
+ import 'package:saber/components/canvas/canvas_background_preview.dart';
+ import 'package:saber/components/canvas/canvas_image_dialog.dart';
+ import 'package:saber/components/canvas/inner_canvas.dart';
++import 'package:saber/components/toolbar/editor_info_section.dart';
+ import 'package:saber/data/editor/editor_core_info.dart';
+ import 'package:saber/data/editor/page.dart';
+ import 'package:saber/data/extensions/list_extensions.dart';
+@@ -311,6 +312,9 @@ class _EditorBottomSheetState extends State<EditorBottomSheet> {
+                   ),
+               ],
+             ),
++            const SizedBox(height: 16),
++            EditorInfoSection(coreInfo: widget.coreInfo),
++            const SizedBox(height: 16),
+           ],
+         ),
+       ),
+diff --git a/lib/components/toolbar/editor_info_section.dart b/lib/components/toolbar/editor_info_section.dart
+new file mode 100644
+index 00000000..e60f8835
+--- /dev/null
++++ b/lib/components/toolbar/editor_info_section.dart
+@@ -0,0 +1,160 @@
++import 'package:flutter/material.dart';
++import 'package:intl/intl.dart';
++import 'package:saber/data/editor/editor_core_info.dart';
++import 'package:saber/data/file_manager/file_manager.dart';
++import 'package:saber/pages/editor/editor.dart';
++
++/// 个人自用版：编辑器底部面板中的「笔记信息」区块。
++///
++/// Shows a few cheap statistics about the note. All of them come from data
++/// that's already in memory, except the file size and the last modified time,
++/// which are read from disk once when the panel is opened.
++class EditorInfoSection extends StatefulWidget {
++  const new({super.key, required this.coreInfo});
++
++  final EditorCoreInfo coreInfo;
++
++  @override
++  State<EditorInfoSection> createState() => _EditorInfoSectionState();
++}
++
++class _EditorInfoSectionState extends State<EditorInfoSection> {
++  static final _whitespace = RegExp(r'\s');
++
++  late final int pageCount;
++  late final int strokeCount;
++  late final int imageCount;
++  late final int characterCount;
++
++  /// The size of the saved file, and when it was last modified.
++  /// [modified] is null if the note has never been saved.
++  late final ({int size, DateTime? modified}) fileStats;
++
++  @override
++  void initState() {
++    super.initState();
++
++    pageCount = widget.coreInfo.pages.length;
++
++    var strokes = 0;
++    var images = 0;
++    var characters = 0;
++    for (final page in widget.coreInfo.pages) {
++      strokes += page.strokes.length;
++      images += page.images.length + (page.backgroundImage == null ? 0 : 1);
++      // the character count only covers typed text, not handwriting
++      characters += page.quill.controller.document
++          .toPlainText()
++          .replaceAll(_whitespace, '')
++          .length;
++    }
++    strokeCount = strokes;
++    imageCount = images;
++    characterCount = characters;
++
++    fileStats = _readFileStats();
++  }
++
++  ({int size, DateTime? modified}) _readFileStats() {
++    final filePath = widget.coreInfo.filePath;
++    // the placeholder core info has no file path yet
++    if (!filePath.startsWith('/')) return (size: 0, modified: null);
++
++    for (final extension in [Editor.extension, Editor.extensionOldJson]) {
++      final file = FileManager.getFile('$filePath$extension');
++      if (!file.existsSync()) continue;
++      return (size: file.lengthSync(), modified: file.lastModifiedSync());
++    }
++    return (size: 0, modified: null);
++  }
++
++  static String _prettyFileSize(int bytes) {
++    if (bytes < 1024) return '$bytes B';
++    final double kilobytes = bytes / 1024;
++    if (kilobytes < 1024) return '${kilobytes.toStringAsFixed(1)} KB';
++    return '${(kilobytes / 1024).toStringAsFixed(2)} MB';
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final textTheme = TextTheme.of(context);
++    final labelStyle = textTheme.bodyMedium?.copyWith(
++      color: ColorScheme.of(context).onSurface.withValues(alpha: 0.7),
++    );
++    final modified = fileStats.modified;
++
++    return Column(
++      crossAxisAlignment: .start,
++      children: [
++        // 个人自用版：未走 i18n
++        Text('笔记信息', style: textTheme.titleMedium),
++        // 个人自用版：未走 i18n
++        Text('字数只统计打字输入的文本，手写内容不计入', style: textTheme.bodyMedium),
++        const SizedBox.square(dimension: 8),
++        _InfoRow(
++          label: '页数',
++          value: '$pageCount',
++          labelStyle: labelStyle,
++        ),
++        _InfoRow(
++          label: '笔画数',
++          value: '$strokeCount',
++          labelStyle: labelStyle,
++        ),
++        _InfoRow(
++          label: '图片数',
++          value: '$imageCount',
++          labelStyle: labelStyle,
++        ),
++        _InfoRow(
++          label: '字数',
++          value: '$characterCount',
++          labelStyle: labelStyle,
++        ),
++        _InfoRow(
++          label: '文件大小',
++          value: _prettyFileSize(fileStats.size),
++          labelStyle: labelStyle,
++        ),
++        _InfoRow(
++          label: '最后修改',
++          value: modified == null
++              ? '（尚未保存）'
++              : DateFormat('yyyy-MM-dd HH:mm').format(modified),
++          labelStyle: labelStyle,
++        ),
++        _InfoRow(
++          label: '笔记格式版本',
++          value: 'sbn2 v${EditorCoreInfo.sbnVersion}',
++          labelStyle: labelStyle,
++        ),
++      ],
++    );
++  }
++}
++
++class _InfoRow extends StatelessWidget {
++  const new({
++    required this.label,
++    required this.value,
++    required this.labelStyle,
++  });
++
++  final String label;
++  final String value;
++  final TextStyle? labelStyle;
++
++  @override
++  Widget build(BuildContext context) {
++    return Padding(
++      padding: const .symmetric(vertical: 3),
++      child: Row(
++        crossAxisAlignment: CrossAxisAlignment.start,
++        children: [
++          SizedBox(width: 110, child: Text(label, style: labelStyle)),
++          Expanded(child: Text(value)),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/components/toolbar/export_bar.dart b/lib/components/toolbar/export_bar.dart
+index dd0d2922..6d4583b4 100644
+--- a/lib/components/toolbar/export_bar.dart
++++ b/lib/components/toolbar/export_bar.dart
+@@ -10,6 +10,8 @@ class ExportBar extends StatefulWidget {
+     required this.exportAsSba,
+     required this.exportAsPdf,
+     required this.exportAsPng,
++    required this.exportAsMarkdown,
++    required this.exportAsPlainText,
+   });
+ 
+   final Axis axis;
+@@ -19,6 +21,8 @@ class ExportBar extends StatefulWidget {
+   final Future Function(BuildContext)? exportAsSba;
+   final Future Function(BuildContext)? exportAsPdf;
+   final Future Function(BuildContext)? exportAsPng;
++  final Future Function(BuildContext)? exportAsMarkdown;
++  final Future Function(BuildContext)? exportAsPlainText;
+ 
+   @override
+   State<ExportBar> createState() => _ExportBarState();
+@@ -85,6 +89,24 @@ class _ExportBarState extends State<ExportBar> {
+           );
+         },
+       ),
++      // 个人自用版：未走 i18n
++      Builder(
++        builder: (context) {
++          return TextButton(
++            onPressed: _onPressed(widget.exportAsMarkdown, context),
++            child: _buttonChild(widget.exportAsMarkdown, 'Markdown'),
++          );
++        },
++      ),
++      // 个人自用版：未走 i18n
++      Builder(
++        builder: (context) {
++          return TextButton(
++            onPressed: _onPressed(widget.exportAsPlainText, context),
++            child: _buttonChild(widget.exportAsPlainText, 'TXT'),
++          );
++        },
++      ),
+     ];
+ 
+     return Center(
+diff --git a/lib/components/toolbar/pen_modal.dart b/lib/components/toolbar/pen_modal.dart
+index bf568f9e..b1e50248 100644
+--- a/lib/components/toolbar/pen_modal.dart
++++ b/lib/components/toolbar/pen_modal.dart
+@@ -1,12 +1,14 @@
+ import 'package:flutter/material.dart';
+ import 'package:flutter_svg/flutter_svg.dart';
+ import 'package:font_awesome_flutter/font_awesome_flutter.dart';
++import 'package:saber/components/toolbar/pen_presets_bar.dart';
+ import 'package:saber/components/toolbar/size_picker.dart';
+ import 'package:saber/data/extensions/axis_extensions.dart';
+ import 'package:saber/data/prefs.dart';
+ import 'package:saber/data/tools/_tool.dart';
+ import 'package:saber/data/tools/highlighter.dart';
+ import 'package:saber/data/tools/pen.dart';
++import 'package:saber/data/tools/pen_presets.dart';
+ import 'package:saber/data/tools/pencil.dart';
+ import 'package:saber/data/tools/shape_pen.dart';
+ import 'package:saber/i18n/strings.g.dart';
+@@ -33,9 +35,13 @@ class _PenModalState extends State<PenModal> {
+       return const SizedBox();
+     }
+ 
+-    return Flex(
++    // 个人自用版：把 Flex 换成 Wrap，这样多出来的笔预设区块
++    // 在窄屏上会换行，而不是让工具栏溢出
++    return Wrap(
+       direction: axis,
+-      mainAxisAlignment: .center,
++      alignment: .center,
++      crossAxisAlignment: .center,
++      runSpacing: 4,
+       children: [
+         SizePicker(axis: axis, pen: currentPen),
+         if (currentPen is! Highlighter && currentPen is! Pencil) ...[
+@@ -112,6 +118,15 @@ class _PenModalState extends State<PenModal> {
+             icon: const FaIcon(ShapePen.shapePenIcon),
+           ),
+         ],
++        const SizedBox.square(dimension: 8),
++        // 个人自用版：自定义笔预设
++        PenPresetsBar(
++          axis: axis,
++          currentPen: currentPen,
++          applyPreset: (preset) => setState(() {
++            widget.setTool(PenPresets.createPen(preset));
++          }),
++        ),
+       ],
+     );
+   }
+diff --git a/lib/components/toolbar/pen_presets_bar.dart b/lib/components/toolbar/pen_presets_bar.dart
+new file mode 100644
+index 00000000..15100b00
+--- /dev/null
++++ b/lib/components/toolbar/pen_presets_bar.dart
+@@ -0,0 +1,256 @@
++import 'package:flutter/cupertino.dart';
++import 'package:flutter/material.dart';
++import 'package:saber/components/theming/adaptive_alert_dialog.dart';
++import 'package:saber/components/theming/uni_icon.dart';
++import 'package:saber/data/prefs.dart';
++import 'package:saber/data/tools/highlighter.dart';
++import 'package:saber/data/tools/pen.dart';
++import 'package:saber/data/tools/pen_presets.dart';
++import 'package:saber/data/tools/pencil.dart';
++import 'package:saber/data/tools/shape_pen.dart';
++import 'package:sbn/tool_id.dart';
++
++/// 个人自用版：笔弹出面板里的「笔预设」区块。
++///
++/// Shows the user's saved presets (tap to apply, long press to delete) and a
++/// button to save the current pen as a new preset.
++class PenPresetsBar extends StatefulWidget {
++  const new({
++    super.key,
++    required this.axis,
++    required this.currentPen,
++    required this.applyPreset,
++  });
++
++  final Axis axis;
++
++  /// The pen whose settings would be saved as a new preset.
++  final Pen currentPen;
++
++  final void Function(PenPreset preset) applyPreset;
++
++  @override
++  State<PenPresetsBar> createState() => _PenPresetsBarState();
++}
++
++class _PenPresetsBarState extends State<PenPresetsBar> {
++  static const _maxWidth = 132.0;
++
++  static Object _iconFor(ToolId toolId) => switch (toolId) {
++    .fountainPen => Pen.fountainPenIcon,
++    .ballpointPen => Pen.ballpointPenIcon,
++    .shapePen => ShapePen.shapePenIcon,
++    .highlighter => Highlighter.highlighterIcon,
++    .pencil => Pencil.pencilIcon,
++    _ => Pen.fountainPenIcon,
++  };
++
++  void _showMessage(String message) {
++    if (!mounted) return;
++    ScaffoldMessenger.of(
++      context,
++    ).showSnackBar(SnackBar(content: Text(message)));
++  }
++
++  Future<void> _savePreset() async {
++    const limitMessage = '最多只能保存 ${PenPreset.maxCount} 组笔预设，长按预设可删除';
++    if (PenPresets.load().length >= PenPreset.maxCount) {
++      _showMessage(limitMessage);
++      return;
++    }
++
++    final name = await showDialog<String>(
++      context: context,
++      builder: (context) =>
++          _SavePresetDialog(initialName: PenPresets.suggestName(widget.currentPen)),
++    );
++    if (name == null) return;
++    if (!mounted) return;
++
++    final presets = PenPresets.add(
++      PenPresets.fromPen(widget.currentPen, name: name),
++    );
++    if (presets == null) {
++      _showMessage(limitMessage);
++      return;
++    }
++    // 个人自用版：未走 i18n
++    _showMessage('已保存预设「$name」');
++  }
++
++  Future<void> _deletePreset(int index) async {
++    final presets = PenPresets.load();
++    if (index < 0 || index >= presets.length) return;
++    final preset = presets[index];
++
++    final confirmed = await showDialog<bool>(
++      context: context,
++      builder: (context) => AdaptiveAlertDialog(
++        // 个人自用版：未走 i18n
++        title: const Text('删除笔预设'),
++        content: Text('确定要删除预设「${preset.name}」吗？'),
++        actions: [
++          CupertinoDialogAction(
++            onPressed: () => Navigator.pop(context, false),
++            // 个人自用版：未走 i18n
++            child: const Text('取消'),
++          ),
++          CupertinoDialogAction(
++            isDestructiveAction: true,
++            onPressed: () => Navigator.pop(context, true),
++            // 个人自用版：未走 i18n
++            child: const Text('删除'),
++          ),
++        ],
++      ),
++    );
++    if (confirmed != true) return;
++    if (!mounted) return;
++
++    PenPresets.removeAt(index);
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return ValueListenableBuilder(
++      valueListenable: stows.penPresets,
++      builder: (context, _, _) {
++        final presets = PenPresets.load();
++        final isHorizontal = widget.axis == Axis.horizontal;
++
++        return Flex(
++          direction: widget.axis,
++          mainAxisSize: .min,
++          children: [
++            if (presets.isNotEmpty) ...[
++              ConstrainedBox(
++                constraints: isHorizontal
++                    ? const BoxConstraints(maxWidth: _maxWidth, maxHeight: 40)
++                    : const BoxConstraints(maxWidth: 40, maxHeight: _maxWidth),
++                child: SingleChildScrollView(
++                  scrollDirection: widget.axis,
++                  child: Flex(
++                    direction: widget.axis,
++                    mainAxisSize: .min,
++                    children: [
++                      for (var index = 0; index < presets.length; index++) ...[
++                        if (index > 0) const SizedBox.square(dimension: 4),
++                        _PresetButton(
++                          preset: presets[index],
++                          icon: _iconFor(presets[index].toolId),
++                          onTap: () => widget.applyPreset(presets[index]),
++                          onDelete: () => _deletePreset(index),
++                        ),
++                      ],
++                    ],
++                  ),
++                ),
++              ),
++              const SizedBox.square(dimension: 4),
++            ],
++            IconButton(
++              onPressed: _savePreset,
++              // 个人自用版：未走 i18n
++              tooltip: '保存为预设',
++              icon: const Icon(Icons.bookmark_add_outlined),
++            ),
++          ],
++        );
++      },
++    );
++  }
++}
++
++class _PresetButton extends StatelessWidget {
++  const new({
++    required this.preset,
++    required this.icon,
++    required this.onTap,
++    required this.onDelete,
++  });
++
++  final PenPreset preset;
++  /// An [IconData] or [FaIconData], see [UniIcon].
++  final Object icon;
++  final VoidCallback onTap;
++  final VoidCallback onDelete;
++
++  @override
++  Widget build(BuildContext context) {
++    final iconColor = ThemeData.estimateBrightnessForColor(preset.color) == .dark
++        ? Colors.white
++        : Colors.black;
++
++    return Tooltip(
++      // 个人自用版：未走 i18n
++      message: '${preset.name}\n点击应用，长按删除',
++      child: InkWell(
++        onTap: onTap,
++        onLongPress: onDelete,
++        customBorder: const CircleBorder(),
++        child: SizedBox.square(
++          dimension: 32,
++          child: DecoratedBox(
++            decoration: BoxDecoration(
++              color: preset.color,
++              shape: .circle,
++              border: Border.all(color: ColorScheme.of(context).outline),
++            ),
++            child: Center(child: UniIcon(icon, size: 15, color: iconColor)),
++          ),
++        ),
++      ),
++    );
++  }
++}
++
++class _SavePresetDialog extends StatefulWidget {
++  const new({required this.initialName});
++
++  final String initialName;
++
++  @override
++  State<_SavePresetDialog> createState() => _SavePresetDialogState();
++}
++
++class _SavePresetDialogState extends State<_SavePresetDialog> {
++  late final controller = TextEditingController(text: widget.initialName);
++
++  @override
++  void dispose() {
++    controller.dispose();
++    super.dispose();
++  }
++
++  void _submit() {
++    final name = controller.text.trim();
++    Navigator.pop(context, name.isEmpty ? widget.initialName : name);
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return AdaptiveAlertDialog(
++      // 个人自用版：未走 i18n
++      title: const Text('保存笔预设'),
++      content: TextField(
++        controller: controller,
++        autofocus: true,
++        // 个人自用版：未走 i18n
++        decoration: const InputDecoration(labelText: '预设名称'),
++        onSubmitted: (_) => _submit(),
++      ),
++      actions: [
++        CupertinoDialogAction(
++          onPressed: () => Navigator.pop(context),
++          // 个人自用版：未走 i18n
++          child: const Text('取消'),
++        ),
++        CupertinoDialogAction(
++          onPressed: _submit,
++          // 个人自用版：未走 i18n
++          child: const Text('保存'),
++        ),
++      ],
++    );
++  }
++}
+diff --git a/lib/components/toolbar/toolbar.dart b/lib/components/toolbar/toolbar.dart
+index 75dd2b80..0d8ea9d1 100644
+--- a/lib/components/toolbar/toolbar.dart
++++ b/lib/components/toolbar/toolbar.dart
+@@ -45,12 +45,13 @@ class Toolbar extends StatefulWidget {
+     required this.isRedoPossible,
+     required this.toggleFingerDrawing,
+     required this.pickPhoto,
+-    required this.paste,
+     required this.duplicateSelection,
+     required this.deleteSelection,
+     required this.exportAsSba,
+     required this.exportAsPdf,
+     required this.exportAsPng,
++    required this.exportAsMarkdown,
++    required this.exportAsPlainText,
+   });
+ 
+   final bool readOnly;
+@@ -72,7 +73,6 @@ class Toolbar extends StatefulWidget {
+ 
+   final VoidCallback pickPhoto;
+ 
+-  final VoidCallback paste;
+ 
+   final VoidCallback duplicateSelection;
+   final VoidCallback deleteSelection;
+@@ -80,6 +80,8 @@ class Toolbar extends StatefulWidget {
+   final Future Function(BuildContext)? exportAsSba;
+   final Future Function(BuildContext)? exportAsPdf;
+   final Future Function(BuildContext)? exportAsPng;
++  final Future Function(BuildContext)? exportAsMarkdown;
++  final Future Function(BuildContext)? exportAsPlainText;
+ 
+   @override
+   State<Toolbar> createState() => _ToolbarState();
+@@ -109,7 +111,6 @@ class _ToolbarState extends State<Toolbar> {
+   Keybinding? _ctrlC;
+   Keybinding? _ctrlShiftS;
+   Keybinding? _f11;
+-  Keybinding? _ctrlV;
+   void _assignKeybindings() {
+     _ctrlF = Keybinding([
+       KeyCode.ctrl,
+@@ -129,17 +130,12 @@ class _ToolbarState extends State<Toolbar> {
+       KeyCode.from(LogicalKeyboardKey.keyS),
+     ], inclusive: true);
+     _f11 = Keybinding([KeyCode.from(LogicalKeyboardKey.f11)], inclusive: true);
+-    _ctrlV = Keybinding([
+-      KeyCode.ctrl,
+-      KeyCode.from(LogicalKeyboardKey.keyV),
+-    ], inclusive: true);
+ 
+     Keybinder.bind(_ctrlF!, widget.toggleFingerDrawing);
+     Keybinder.bind(_ctrlE!, toggleEraser);
+     Keybinder.bind(_ctrlC!, toggleColorOptions);
+     Keybinder.bind(_ctrlShiftS!, toggleExportBar);
+     Keybinder.bind(_f11!, toggleFullscreen);
+-    Keybinder.bind(_ctrlV!, widget.paste);
+   }
+ 
+   void _removeKeybindings() {
+@@ -148,7 +144,6 @@ class _ToolbarState extends State<Toolbar> {
+     if (_ctrlC != null) Keybinder.remove(_ctrlC!);
+     if (_ctrlShiftS != null) Keybinder.remove(_ctrlShiftS!);
+     if (_f11 != null) Keybinder.remove(_f11!);
+-    if (_ctrlV != null) Keybinder.remove(_ctrlV!);
+   }
+ 
+   void toggleEraser() {
+@@ -218,6 +213,8 @@ class _ToolbarState extends State<Toolbar> {
+           exportAsSba: widget.exportAsSba,
+           exportAsPdf: widget.exportAsPdf,
+           exportAsPng: widget.exportAsPng,
++          exportAsMarkdown: widget.exportAsMarkdown,
++          exportAsPlainText: widget.exportAsPlainText,
+         ),
+       ),
+       ValueListenableBuilder(
+diff --git a/lib/data/editor/editor_exporter.dart b/lib/data/editor/editor_exporter.dart
+index 734c4781..9cb94d8f 100644
+--- a/lib/data/editor/editor_exporter.dart
++++ b/lib/data/editor/editor_exporter.dart
+@@ -14,6 +14,7 @@ import 'package:saber/components/canvas/_stroke.dart';
+ import 'package:saber/components/canvas/canvas_preview.dart';
+ import 'package:saber/components/canvas/inner_canvas.dart';
+ import 'package:saber/data/editor/editor_core_info.dart';
++import 'package:saber/data/editor/quill_to_markdown.dart';
+ import 'package:saber/data/is_this_a_test.dart';
+ import 'package:screenshot/screenshot.dart';
+ 
+@@ -28,6 +29,78 @@ abstract class EditorExporter {
+     return stroke.toolId == .highlighter || stroke.toolId == .pencil;
+   }
+ 
++  /// 个人自用版：把笔记导出成 Markdown。
++  ///
++  /// Only the typed text is exported: handwritten strokes and images can't be
++  /// represented in Markdown, so they're reported in the file header instead.
++  static String generateMarkdown(EditorCoreInfo coreInfo) =>
++      _generateText(coreInfo, markdown: true);
++
++  /// 个人自用版：把笔记导出成纯文本（Markdown 导出对应的无格式版本）。
++  static String generatePlainText(EditorCoreInfo coreInfo) =>
++      _generateText(coreInfo, markdown: false);
++
++  static String _generateText(
++    EditorCoreInfo coreInfo, {
++    required bool markdown,
++  }) {
++    /// Don't export trailing empty pages.
++    final pages = coreInfo.pages.toList();
++    while (pages.length > 1 && pages.last.isEmpty) {
++      pages.removeLast();
++    }
++
++    var totalStrokes = 0;
++    var totalImages = 0;
++    for (final page in pages) {
++      totalStrokes += page.strokes.length;
++      totalImages += page.images.length + (page.backgroundImage == null ? 0 : 1);
++    }
++
++    final out = StringBuffer();
++    if (markdown) {
++      out.writeln('# ${coreInfo.fileName}');
++    } else {
++      out.writeln(coreInfo.fileName);
++      out.writeln('=' * coreInfo.fileName.length);
++    }
++    out.writeln();
++
++    if (totalStrokes > 0 || totalImages > 0) {
++      final warning =
++          '注意：本笔记含手写/图片内容（共 $totalStrokes 笔、$totalImages 张图片），'
++          '本次导出只包含打字输入的文本部分。';
++      out.writeln(markdown ? '> $warning' : warning);
++      out.writeln();
++    }
++
++    for (var i = 0; i < pages.length; i++) {
++      final page = pages[i];
++
++      if (pages.length > 1) {
++        out.writeln(markdown ? '## 第 ${i + 1} 页' : '【第 ${i + 1} 页】');
++        out.writeln();
++      }
++
++      final document = page.quill.controller.document;
++      final text = markdown
++          ? QuillToMarkdown.convert(document)
++          : document.toPlainText().trim();
++      out.writeln(text.isEmpty ? '（本页没有文本内容）' : text);
++      out.writeln();
++
++      final strokes = page.strokes.length;
++      final images = page.images.length + (page.backgroundImage == null ? 0 : 1);
++      if (strokes > 0 || images > 0) {
++        final note = '本页还有 $strokes 笔手写、$images 张图片，未包含在文本导出中';
++        out.writeln(markdown ? '*（$note）*' : '（$note）');
++        out.writeln();
++      }
++    }
++
++    return '${out.toString().trimRight()}\n';
++  }
++
+   static Future<pw.Document> generatePdf(
+     EditorCoreInfo coreInfo,
+     BuildContext context,
+diff --git a/lib/data/editor/quill_to_markdown.dart b/lib/data/editor/quill_to_markdown.dart
+new file mode 100644
+index 00000000..2443596d
+--- /dev/null
++++ b/lib/data/editor/quill_to_markdown.dart
+@@ -0,0 +1,184 @@
++import 'package:flutter_quill/flutter_quill.dart';
++
++/// Converts a Quill [Document] into Markdown.
++///
++/// Note: flutter_quill 11.5.1 does ship a `DeltaToMarkdown` converter, but it
++/// isn't exported from `package:flutter_quill/flutter_quill.dart`; it only
++/// lives in `src/packages/quill_markdown/`, so using it would mean an
++/// implementation import of a private path. This is a small, self-contained
++/// replacement which additionally degrades embeds (images, videos, ...) into
++/// readable placeholders instead of silently dropping them.
++///
++/// Supported: headers, bold, italic, underline, strikethrough, inline code,
++/// code blocks, block quotes, ordered/bullet/checkbox lists, indentation,
++/// sub/superscript and links. Fonts, sizes, colors and alignments have no
++/// Markdown equivalent and are dropped.
++abstract class QuillToMarkdown {
++  /// Converts [document] into a Markdown string,
++  /// without leading or trailing blank lines.
++  static String convert(Document document) {
++    final out = StringBuffer();
++
++    /// The inline segments of the line currently being written.
++    final segments = <({String text, Map<String, dynamic>? attributes})>[];
++
++    /// Whether we're inside a fenced code block, so that blank lines and
++    /// inline formatting are written verbatim.
++    var inCodeBlock = false;
++
++    void flushLine(Map<String, dynamic>? attributes) {
++      final attrs = attributes ?? const <String, dynamic>{};
++      final codeBlock = attrs['code-block'];
++      final isCodeBlock = codeBlock == true || codeBlock is String;
++
++      if (inCodeBlock && !isCodeBlock) {
++        out.writeln('```');
++        inCodeBlock = false;
++      }
++
++      final content = segments
++          .map(
++            (segment) => isCodeBlock
++                ? segment.text
++                : _inline(segment.text, segment.attributes),
++          )
++          .join();
++      segments.clear();
++
++      if (isCodeBlock) {
++        if (!inCodeBlock) {
++          final language = codeBlock is String && codeBlock != 'true'
++              ? codeBlock
++              : '';
++          out.writeln('```$language');
++          inCodeBlock = true;
++        }
++        out.writeln(content);
++        return;
++      }
++
++      final line = '${_blockPrefix(attrs)}$content'.trimRight();
++      if (line.isEmpty) {
++        out.writeln();
++      } else {
++        out.writeln(line);
++      }
++    }
++
++    for (final operation in document.toDelta().operations) {
++      final attributes = operation.attributes;
++      final data = operation.data;
++      if (data is String) {
++        var start = 0;
++        while (true) {
++          final newlineIndex = data.indexOf('\n', start);
++          if (newlineIndex == -1) break;
++          if (newlineIndex > start) {
++            segments.add((
++              text: data.substring(start, newlineIndex),
++              attributes: attributes,
++            ));
++          }
++          // block attributes are stored on the newline itself
++          flushLine(attributes);
++          start = newlineIndex + 1;
++        }
++        if (start < data.length) {
++          segments.add((text: data.substring(start), attributes: attributes));
++        }
++      } else if (data is Map) {
++        segments.add((text: _embedToMarkdown(data), attributes: attributes));
++      }
++    }
++    // the document usually ends with a newline, but not always
++    if (segments.isNotEmpty) flushLine(null);
++    if (inCodeBlock) out.writeln('```');
++
++    return out
++        .toString()
++        .replaceFirst(RegExp(r'^\n+'), '')
++        .trimRight();
++  }
++
++  /// The Markdown prefix for a line with the given block [attributes],
++  /// e.g. `## ` for a level 2 header or `- ` for a bullet list item.
++  static String _blockPrefix(Map<String, dynamic> attributes) {
++    final indent = attributes['indent'];
++    final indentLevel = indent is int ? indent : 0;
++    final indentation = '  ' * indentLevel;
++
++    final header = attributes['header'];
++    if (header is int) {
++      return '${'#' * header.clamp(1, 6).toInt()} ';
++    }
++
++    switch (attributes['list']) {
++      case 'ordered':
++        return '${indentation}1. ';
++      case 'bullet':
++        return '$indentation- ';
++      case 'checked':
++        return '$indentation- [x] ';
++      case 'unchecked':
++        return '$indentation- [ ] ';
++    }
++
++    if (attributes['blockquote'] == true) return '> ';
++    if (indentLevel > 0) return indentation;
++    return '';
++  }
++
++  /// Wraps [text] in the Markdown markers for its inline [attributes].
++  static String _inline(String text, Map<String, dynamic>? attributes) {
++    if (text.isEmpty) return text;
++    if (attributes == null || attributes.isEmpty) return text;
++
++    var result = text;
++
++    // innermost first, so that e.g. bold + italic becomes `***text***`
++    if (attributes['code'] == true) result = '`$result`';
++    if (attributes['bold'] == true) result = '**$result**';
++    if (attributes['italic'] == true) result = '*$result*';
++    if (attributes['strike'] == true) result = '~~$result~~';
++    if (attributes['underline'] == true) result = '<u>$result</u>';
++
++    switch (attributes['script']) {
++      case 'sub':
++        result = '<sub>$result</sub>';
++      case 'super':
++        result = '<sup>$result</sup>';
++    }
++
++    // outermost, so that a link can contain formatted text
++    final href = _linkHref(attributes['link']);
++    if (href != null && href.isNotEmpty) result = '[$result]($href)';
++
++    return result;
++  }
++
++  /// Quill stores a link either as a plain string, or as a map (in newer
++  /// versions, e.g. `{"href": "...", "text": "..."}`).
++  static String? _linkHref(Object? link) {
++    if (link is String) return link;
++    if (link is Map) {
++      final href = link['href'];
++      if (href is String) return href;
++    }
++    return null;
++  }
++
++  /// Embeds (images, videos, ...) can't be represented in Markdown,
++  /// so they're replaced with a placeholder that says what was there.
++  static String _embedToMarkdown(Map<dynamic, dynamic> data) {
++    if (data.containsKey('image')) {
++      final src = data['image'];
++      if (src is String && src.isNotEmpty) {
++        return '![图片：内嵌资源，无法导出到文本]($src)';
++      }
++      return '![图片：内嵌资源，无法导出到文本]';
++    }
++    if (data.containsKey('video')) return '[视频：无法导出到文本]';
++    if (data.containsKey('file')) return '[附件：无法导出到文本]';
++    return '[嵌入内容：无法导出到文本]';
++  }
++}
+diff --git a/lib/data/file_manager/file_manager.dart b/lib/data/file_manager/file_manager.dart
+index 59648989..26b44540 100644
+--- a/lib/data/file_manager/file_manager.dart
++++ b/lib/data/file_manager/file_manager.dart
+@@ -440,9 +440,17 @@ class FileManager {
+     String filePath, {
+     bool alsoUpload = true,
+     bool alsoDeleteAssets = true,
++    bool moveToTrash = true,
+   }) async {
+     filePath = _sanitisePath(filePath);
+ 
++    // 个人自用版：笔记改为软删除（移入回收站），可在回收站页面恢复或彻底删除。
++    // Assets are never trashed on their own; they follow their note.
++    if (moveToTrash && !assetFileRegex.hasMatch(filePath)) {
++      await moveFileToTrash(filePath, alsoMoveAssets: alsoDeleteAssets);
++      return;
++    }
++
+     final file = getFile(filePath);
+     if (!file.existsSync()) return;
+     await file.delete();
+@@ -471,6 +479,257 @@ class FileManager {
+     }
+   }
+ 
++  // 个人自用版：回收站（软删除）
++  //
++  // The trash directory is a *sibling* of [documentsDirectory] instead of a
++  // child, so trashed notes are never listed by [getChildrenOfDirectory] or
++  // [getAllFiles], which only walk the notes root directory.
++  static const trashDirectoryName = '.saber-trash';
++
++  /// The absolute path of the trash directory.
++  static String get trashDirectory => p.join(
++    p.dirname(p.normalize(documentsDirectory)),
++    trashDirectoryName,
++  );
++
++  /// Converts a path relative to the trash directory into an absolute [File].
++  static File _getTrashFile(String trashPath) {
++    final relative = trashPath.replaceAll('\\', '/').replaceFirst('/', '');
++    return File(p.join(trashDirectory, relative));
++  }
++
++  static bool _trashFileExists(String trashPath) =>
++      _getTrashFile(trashPath).existsSync();
++
++  /// 个人自用版：把 [filePath] 移动到回收站，而不是直接删掉。
++  ///
++  /// The note keeps its relative path inside the trash directory, so it can be
++  /// restored to where it was. Its assets (`.sbn2.p`, `.sbn2.0`, ...) are moved
++  /// along with it.
++  static Future<void> moveFileToTrash(
++    String filePath, {
++    bool alsoMoveAssets = true,
++  }) async {
++    filePath = _sanitisePath(filePath);
++    final fromFile = getFile(filePath);
++    if (!fromFile.existsSync()) return;
++
++    final trashPath = _uniqueTrashPath(filePath);
++    final trashFile = _getTrashFile(trashPath);
++    await trashFile.parent.create(recursive: true);
++    await _moveRawFile(fromFile, trashFile);
++
++    await _removeReferences(filePath);
++    broadcastFileWrite(FileOperationType.delete, filePath);
++
++    if (alsoMoveAssets && !assetFileRegex.hasMatch(filePath)) {
++      final assets = <String>[];
++      for (int assetNumber = 0; true; assetNumber++) {
++        if (!getFile('$filePath.$assetNumber').existsSync()) break;
++        assets.add('$assetNumber');
++      }
++      const previewAsset = 'p';
++      if (getFile('$filePath.$previewAsset').existsSync()) {
++        assets.add(previewAsset);
++      }
++
++      for (final asset in assets) {
++        final trashAsset = _getTrashFile('$trashPath.$asset');
++        await trashAsset.parent.create(recursive: true);
++        await _moveRawFile(getFile('$filePath.$asset'), trashAsset);
++      }
++    }
++  }
++
++  /// Returns a path relative to the trash directory that doesn't collide
++  /// with a note that's already in the trash.
++  static String _uniqueTrashPath(String filePath) {
++    var trashPath = filePath;
++    if (!_trashFileExists(trashPath)) return trashPath;
++
++    final directory = p.dirname(trashPath);
++    final extension = p.extension(trashPath);
++    final name = p.basenameWithoutExtension(trashPath);
++
++    int i = 1;
++    do {
++      i++;
++      trashPath = p.join(directory, '$name ($i)$extension');
++    } while (_trashFileExists(trashPath));
++    return trashPath;
++  }
++
++  /// Moves a file, falling back to copy+delete across devices
++  /// (e.g. private to public storage on Android).
++  static Future<void> _moveRawFile(File from, File to) async {
++    try {
++      await from.rename(to.path);
++    } on FileSystemException catch (e) {
++      const exdev = 18;
++      if (e.osError?.errorCode == exdev) {
++        await from.copy(to.path);
++        await from.delete();
++      } else {
++        rethrow;
++      }
++    }
++  }
++
++  /// 个人自用版：列出回收站里的所有笔记，最近删除的在最前面。
++  static Future<List<TrashedNote>> listTrashedNotes() async {
++    final trashDir = Directory(trashDirectory);
++    if (!trashDir.existsSync()) return [];
++
++    final notes = <TrashedNote>[];
++    await for (final entity in trashDir.list(recursive: true)) {
++      if (entity is! File) continue;
++
++      final trashPath = p
++          .relative(entity.path, from: trashDirectory)
++          .replaceAll('\\', '/');
++      if (assetFileRegex.hasMatch(trashPath)) continue;
++      if (!trashPath.endsWith(Editor.extension) &&
++          !trashPath.endsWith(Editor.extensionOldJson)) {
++        continue;
++      }
++      if (Editor.isReservedPath('/$trashPath')) continue;
++
++      notes.add(TrashedNote(trashPath, entity.lastModifiedSync()));
++    }
++
++    notes.sort((a, b) => b.deletedAt.compareTo(a.deletedAt));
++    return notes;
++  }
++
++  /// 个人自用版：把回收站里的笔记恢复到原来的位置。
++  ///
++  /// If a note already exists at the original path, the restored note is
++  /// renamed to `foo (已恢复).sbn2` instead of overwriting it.
++  ///
++  /// Returns the path the note was restored to.
++  static Future<String> restoreFromTrash(String trashPath) async {
++    final source = _getTrashFile(trashPath);
++    if (!source.existsSync()) {
++      throw FileSystemException('Note is no longer in the trash', source.path);
++    }
++
++    final restorePath = _uniqueRestorePath(_normaliseRelativePath(trashPath));
++    final target = getFile(restorePath);
++    await _createFileDirectory(restorePath);
++    await _moveRawFile(source, target);
++
++    for (int assetNumber = 0; true; assetNumber++) {
++      final trashAsset = _getTrashFile('$trashPath.$assetNumber');
++      if (!trashAsset.existsSync()) break;
++      final assetFile = getFile('$restorePath.$assetNumber');
++      await assetFile.parent.create(recursive: true);
++      await _moveRawFile(trashAsset, assetFile);
++    }
++    const previewAsset = 'p';
++    final trashPreview = _getTrashFile('$trashPath.$previewAsset');
++    if (trashPreview.existsSync()) {
++      final previewFile = getFile('$restorePath.$previewAsset');
++      await previewFile.parent.create(recursive: true);
++      await _moveRawFile(trashPreview, previewFile);
++    }
++
++    await _removeEmptyTrashDirectories(source.parent);
++    await _saveFileAsRecentlyAccessed(restorePath);
++    broadcastFileWrite(FileOperationType.write, restorePath);
++
++    return restorePath;
++  }
++
++  /// Returns a path to restore a note to, avoiding overwriting an existing note.
++  static String _uniqueRestorePath(String notePath) {
++    if (!_doesNoteExist(notePath)) return notePath;
++
++    final directory = p.dirname(notePath);
++    final extension = p.extension(notePath);
++    final name = p.basenameWithoutExtension(notePath);
++    // 个人自用版：未走 i18n，直接使用中文后缀
++    const restoredSuffix = '已恢复';
++
++    var candidate = p.join(directory, '$name ($restoredSuffix)$extension');
++    int i = 1;
++    while (_doesNoteExist(candidate)) {
++      i++;
++      candidate = p.join(directory, '$name ($restoredSuffix $i)$extension');
++    }
++    return candidate;
++  }
++
++  /// Whether a note exists at [notePath] (which includes its extension),
++  /// in either the new or the old file format.
++  static bool _doesNoteExist(String notePath) {
++    if (doesFileExist(notePath)) return true;
++    if (notePath.endsWith(Editor.extension)) {
++      return doesFileExist(
++        '${notePath.substring(0, notePath.length - Editor.extension.length)}'
++        '${Editor.extensionOldJson}',
++      );
++    } else if (notePath.endsWith(Editor.extensionOldJson)) {
++      return doesFileExist(
++        '${notePath.substring(0, notePath.length - Editor.extensionOldJson.length)}'
++        '${Editor.extension}',
++      );
++    }
++    return false;
++  }
++
++  /// Removes the (now empty) directories that a trashed note left behind.
++  static Future<void> _removeEmptyTrashDirectories(Directory directory) async {
++    final trashRoot = p.normalize(trashDirectory);
++    var current = directory;
++    while (current.existsSync() &&
++        p.isWithin(trashRoot, current.path) &&
++        current.listSync().isEmpty) {
++      final parent = current.parent;
++      try {
++        await current.delete();
++      } on FileSystemException {
++        return;
++      }
++      current = parent;
++    }
++  }
++
++  /// 个人自用版：把回收站里的一条笔记彻底删除。
++  static Future<void> permanentlyDeleteFromTrash(String trashPath) async {
++    final file = _getTrashFile(trashPath);
++    if (file.existsSync()) await file.delete();
++
++    for (int assetNumber = 0; true; assetNumber++) {
++      final asset = _getTrashFile('$trashPath.$assetNumber');
++      if (!asset.existsSync()) break;
++      await asset.delete();
++    }
++    const previewAsset = 'p';
++    final preview = _getTrashFile('$trashPath.$previewAsset');
++    if (preview.existsSync()) await preview.delete();
++
++    await _removeEmptyTrashDirectories(file.parent);
++  }
++
++  /// 个人自用版：清空回收站。
++  static Future<void> emptyTrash() async {
++    final trashDir = Directory(trashDirectory);
++    if (!trashDir.existsSync()) return;
++
++    // Safety check: never delete the notes directory itself.
++    final trashRoot = p.normalize(trashDirectory);
++    final notesRoot = p.normalize(documentsDirectory);
++    assert(
++      !p.isWithin(trashRoot, notesRoot),
++      'The trash directory must not contain the notes directory',
++    );
++    if (p.isWithin(trashRoot, notesRoot)) return;
++
++    await for (final entity in trashDir.list()) {
++      await entity.delete(recursive: true);
++    }
++  }
++
+   static Future removeUnusedAssets(
+     String filePath, {
+     required int numAssets,
+@@ -902,28 +1161,61 @@ class FileManager {
+         .create(recursive: true);
+   }
+ 
++  /// Normalises a relative note path into the form used by
++  /// [stows.recentFiles] and [stows.pinnedFiles] (e.g. `/Notes/foo.sbn2`).
++  static String _normaliseRelativePath(String filePath) {
++    var path = filePath.replaceAll('\\', '/');
++    if (!path.startsWith('/')) path = '/$path';
++    return path;
++  }
++
+   static Future _renameReferences(String fromPath, String toPath) async {
++    final normalisedFrom = _normaliseRelativePath(fromPath);
++    final normalisedTo = _normaliseRelativePath(toPath);
++
+     // rename file in recently accessed
+     bool replaced = false;
+     for (int i = 0; i < stows.recentFiles.value.length; i++) {
+-      if (stows.recentFiles.value[i] != fromPath) continue;
++      if (_normaliseRelativePath(stows.recentFiles.value[i]) != normalisedFrom)
++        continue;
+       if (!replaced) {
+-        stows.recentFiles.value[i] = toPath;
++        stows.recentFiles.value[i] = normalisedTo;
+         replaced = true;
+       } else {
+         stows.recentFiles.value.removeAt(i);
+       }
+     }
+     stows.recentFiles.notifyListeners();
++
++    // 个人自用版：置顶（收藏）的笔记也要跟着重命名/移动
++    replaced = false;
++    for (int i = 0; i < stows.pinnedFiles.value.length; i++) {
++      if (_normaliseRelativePath(stows.pinnedFiles.value[i]) != normalisedFrom)
++        continue;
++      if (!replaced) {
++        stows.pinnedFiles.value[i] = normalisedTo;
++        replaced = true;
++      } else {
++        stows.pinnedFiles.value.removeAt(i);
++      }
++    }
++    stows.pinnedFiles.notifyListeners();
+   }
+ 
+   static Future _removeReferences(String filePath) async {
++    final normalisedPath = _normaliseRelativePath(filePath);
++
+     // remove file from recently accessed
+-    for (int i = 0; i < stows.recentFiles.value.length; i++) {
+-      if (stows.recentFiles.value[i] != filePath) continue;
+-      stows.recentFiles.value.removeAt(i);
+-    }
++    stows.recentFiles.value.removeWhere(
++      (path) => _normaliseRelativePath(path) == normalisedPath,
++    );
+     stows.recentFiles.notifyListeners();
++
++    // 个人自用版：同时移除置顶（收藏）列表里的失效条目
++    stows.pinnedFiles.value.removeWhere(
++      (path) => _normaliseRelativePath(path) == normalisedPath,
++    );
++    stows.pinnedFiles.notifyListeners();
+   }
+ 
+   static Future _saveFileAsRecentlyAccessed(String filePath) async {
+@@ -953,6 +1245,29 @@ class DirectoryChildren {
+   bool get isNotEmpty => !isEmpty;
+ }
+ 
++/// 个人自用版：回收站中的一条笔记。
++class TrashedNote {
++  /// The note's path inside the trash directory, e.g. `Notes/foo.sbn2`.
++  final String trashPath;
++
++  /// When the note was moved to the trash.
++  final DateTime deletedAt;
++
++  const new(this.trashPath, this.deletedAt);
++
++  /// The note's file name without its extension, e.g. `foo`.
++  String get title => p.basenameWithoutExtension(trashPath);
++
++  /// The note's original parent directory, e.g. `/Notes`.
++  String get parentDirectory {
++    final directory = p.dirname(trashPath).replaceAll('\\', '/');
++    return directory == '.' ? '/' : '/$directory';
++  }
++
++  /// The relative path the note will be restored to.
++  String get originalPath => '/${trashPath.replaceAll('\\', '/')}';
++}
++
+ enum FileOperationType { write, delete }
+ 
+ class FileOperation {
+diff --git a/lib/data/file_manager/note_search.dart b/lib/data/file_manager/note_search.dart
+new file mode 100644
+index 00000000..5d7c8565
+--- /dev/null
++++ b/lib/data/file_manager/note_search.dart
+@@ -0,0 +1,115 @@
++import 'dart:convert';
++import 'dart:io';
++
++import 'package:bson/bson.dart';
++import 'package:flutter/foundation.dart';
++import 'package:saber/data/file_manager/file_manager.dart';
++import 'package:saber/pages/editor/editor.dart';
++import 'package:worker_manager/worker_manager.dart';
++
++/// 个人自用版：笔记全文搜索的底层实现。
++///
++/// Notes are `.sbn2` files (bson), whose pages each store a Quill delta under
++/// the `q` key. Instead of building a whole `EditorCoreInfo` (which would also
++/// parse every stroke and image), this reads only the text of the note, in a
++/// worker isolate so that searching many notes doesn't block the UI.
++abstract class NoteSearch {
++  /// Whether every page of a note is searched, or only its first page.
++  ///
++  /// Reading all pages is more useful but also slower, so this is configurable.
++  static var searchAllPages = true;
++
++  /// Reads [filePath] (a relative note path, with or without its extension)
++  /// and returns its plain text, or `null` if it couldn't be read.
++  ///
++  /// Cancelling the returned [Cancelable] makes the worker stop as soon as it
++  /// can, which is how the search page stays responsive while typing.
++  static Cancelable<String?> readPlainText(String filePath) {
++    final absolutePath = FileManager.getFile(_withExtension(filePath)).path;
++    final isBson = absolutePath.endsWith(Editor.extension);
++
++    return workerManager.executeGentle<String?>((isCanceled) async {
++      if (isCanceled()) return null;
++
++      final bytes = await File(absolutePath).readAsBytes();
++      if (isCanceled()) return null;
++
++      return extractPlainText(bytes: bytes, isBson: isBson);
++    }, priority: WorkPriority.low);
++  }
++
++  static String _withExtension(String filePath) {
++    if (filePath.endsWith(Editor.extension) ||
++        filePath.endsWith(Editor.extensionOldJson)) {
++      return filePath;
++    }
++    if (FileManager.doesFileExist('$filePath${Editor.extensionOldJson}')) {
++      return '$filePath${Editor.extensionOldJson}';
++    }
++    return '$filePath${Editor.extension}';
++  }
++
++  /// Extracts the text of a note from the raw contents of its file.
++  ///
++  /// This runs inside a worker isolate, so it must not touch any state of the
++  /// main isolate.
++  @visibleForTesting
++  static String? extractPlainText({
++    required Uint8List bytes,
++    required bool isBson,
++  }) {
++    try {
++      final dynamic json = isBson
++          ? BsonCodec.deserialize(BsonBinary.from(bytes))
++          : jsonDecode(utf8.decode(bytes));
++      return _plainTextOfJson(json);
++    } catch (_) {
++      return null;
++    }
++  }
++
++  static String _plainTextOfJson(dynamic json) {
++    // The oldest format is just a list of strokes, which has no text.
++    if (json is! Map) return '';
++
++    final buffer = StringBuffer();
++    final pages = json['z'];
++    if (pages is! List) return '';
++
++    for (final page in pages) {
++      if (page is! Map) continue;
++      final delta = page['q'];
++      if (delta is! List) continue;
++
++      for (final op in delta) {
++        if (op is! Map) continue;
++        final insert = op['insert'];
++        if (insert is String) buffer.write(insert);
++      }
++      buffer.write('\n');
++
++      if (!searchAllPages) break;
++    }
++
++    return buffer.toString();
++  }
++
++  /// Returns a short snippet of [text] around the first occurrence of [query],
++  /// or `null` if [text] doesn't contain [query].
++  static String? makeSnippet(String text, String query, {int context = 30}) {
++    final index = text.toLowerCase().indexOf(query.toLowerCase());
++    if (index == -1) return null;
++
++    var start = index - context;
++    if (start < 0) start = 0;
++    var end = index + query.length + context;
++    if (end > text.length) end = text.length;
++
++    final snippet = text
++        .substring(start, end)
++        .replaceAll(RegExp(r'\s+'), ' ')
++        .trim();
++
++    return '${start > 0 ? '…' : ''}$snippet${end < text.length ? '…' : ''}';
++  }
++}
+diff --git a/lib/data/file_manager/pinned_notes.dart b/lib/data/file_manager/pinned_notes.dart
+new file mode 100644
+index 00000000..399d3546
+--- /dev/null
++++ b/lib/data/file_manager/pinned_notes.dart
+@@ -0,0 +1,74 @@
++import 'package:saber/data/file_manager/file_manager.dart';
++import 'package:saber/data/prefs.dart';
++import 'package:saber/pages/editor/editor.dart';
++
++/// 个人自用版：收藏（置顶）笔记的工具函数。
++///
++/// [stows.pinnedFiles] stores relative paths *with* their extension
++/// (e.g. `/Notes/foo.sbn2`), just like [stows.recentFiles]. Some places in the
++/// app refer to notes without the extension (e.g. `PreviewCard.filePath`), so
++/// always go through this class to convert between the two forms.
++abstract class PinnedNotes {
++  /// Converts a note path that may or may not include its extension into the
++  /// form used by [stows.pinnedFiles].
++  static String withExtension(String filePath) {
++    if (filePath.endsWith(Editor.extension) ||
++        filePath.endsWith(Editor.extensionOldJson)) {
++      return filePath;
++    }
++    if (FileManager.doesFileExist('$filePath${Editor.extensionOldJson}')) {
++      return '$filePath${Editor.extensionOldJson}';
++    }
++    return '$filePath${Editor.extension}';
++  }
++
++  /// Removes the file extension from a note path.
++  static String withoutExtension(String filePath) {
++    if (filePath.endsWith(Editor.extension)) {
++      return filePath.substring(0, filePath.length - Editor.extension.length);
++    } else if (filePath.endsWith(Editor.extensionOldJson)) {
++      return filePath.substring(
++        0,
++        filePath.length - Editor.extensionOldJson.length,
++      );
++    }
++    return filePath;
++  }
++
++  /// Whether the note at [filePath] is pinned (filePath may omit its extension).
++  static bool isPinned(String filePath) {
++    final path = withExtension(filePath);
++    return stows.pinnedFiles.value.contains(path);
++  }
++
++  /// Pins or unpins the note at [filePath].
++  static void setPinned(String filePath, {required bool pinned}) {
++    final path = withExtension(filePath);
++    stows.pinnedFiles.value.remove(path);
++    if (pinned) {
++      // newest pin first, so it's easy to find at the top of the home page
++      stows.pinnedFiles.value.insert(0, path);
++    }
++    stows.pinnedFiles.notifyListeners();
++  }
++
++  /// Pins the note if it isn't pinned, and unpins it otherwise.
++  static void togglePinned(String filePath) {
++    setPinned(filePath, pinned: !isPinned(filePath));
++  }
++
++  /// Pinned notes that still exist, without their extension, in display order.
++  static List<String> existingPinnedNotes() {
++    final result = <String>[];
++    for (final path in stows.pinnedFiles.value) {
++      final withoutExt = withoutExtension(path);
++      if (result.contains(withoutExt)) continue;
++      if (!FileManager.doesFileExist('$withoutExt${Editor.extension}') &&
++          !FileManager.doesFileExist('$withoutExt${Editor.extensionOldJson}')) {
++        continue;
++      }
++      result.add(withoutExt);
++    }
++    return result;
++  }
++}
+diff --git a/lib/data/prefs.dart b/lib/data/prefs.dart
+index 01b91335..d833d1e5 100644
+--- a/lib/data/prefs.dart
++++ b/lib/data/prefs.dart
+@@ -305,6 +305,23 @@ class Stows {
+     volatile: !_isOnMainIsolate,
+   );
+ 
++  /// Relative paths (e.g. `/Notes/foo.sbn2`) of notes the user pinned, in
++  /// display order. Pinned notes are shown above the recent notes list.
++  final pinnedFiles = PlainStow(
++    'pinnedFiles',
++    <String>[],
++    volatile: !_isOnMainIsolate,
++  );
++
++  /// User-defined pen presets, serialised as a JSON string by
++  /// `lib/data/tools/pen_presets.dart`. Kept as an opaque string here so the
++  /// preset model can evolve without a stow codec migration.
++  final penPresets = PlainStow(
++    'penPresets',
++    '',
++    volatile: !_isOnMainIsolate,
++  );
++
+   final locale = PlainStow('locale', '', volatile: !_isOnMainIsolate);
+ 
+   @pragma('vm:platform-const')
+diff --git a/lib/data/routes.dart b/lib/data/routes.dart
+index a75125c7..cd9843bc 100644
+--- a/lib/data/routes.dart
++++ b/lib/data/routes.dart
+@@ -1,9 +1,12 @@
+ import 'package:flutter/cupertino.dart';
+ import 'package:flutter/material.dart';
++import 'package:go_router/go_router.dart';
+ import 'package:path_to_regexp/path_to_regexp.dart';
+ import 'package:saber/components/theming/adaptive_icon.dart';
+ import 'package:saber/i18n/strings.g.dart';
+ import 'package:saber/pages/home/home.dart';
++import 'package:saber/pages/home/search.dart';
++import 'package:saber/pages/home/trash.dart';
+ 
+ // workaround to assign strings as enum values
+ abstract class RoutePaths {
+@@ -11,6 +14,10 @@ abstract class RoutePaths {
+   static const edit = '/edit';
+   static const logs = '/logs';
+ 
++  // 个人自用版：全文搜索页与回收站页
++  static const search = '/search';
++  static const trash = '/trash';
++
+   static const prefixOfHome = '/home';
+ 
+   static String editFilePath(String filePath) {
+@@ -24,6 +31,21 @@ abstract class RoutePaths {
+   }
+ }
+ 
++/// 个人自用版：额外页面（全文搜索、回收站）的路由，
++/// 由 `main.dart` 的 GoRouter 展开，这样不用改动 main.dart 的 import。
++abstract class ExtraRoutes {
++  static final routes = <GoRoute>[
++    GoRoute(
++      path: RoutePaths.search,
++      builder: (context, state) => const SearchPage(),
++    ),
++    GoRoute(
++      path: RoutePaths.trash,
++      builder: (context, state) => const TrashPage(),
++    ),
++  ];
++}
++
+ abstract class HomeRoutes {
+   static String browseFilePath(String? filePath) {
+     var path = routes[1].path;
+diff --git a/lib/data/tools/pen_presets.dart b/lib/data/tools/pen_presets.dart
+new file mode 100644
+index 00000000..862509a1
+--- /dev/null
++++ b/lib/data/tools/pen_presets.dart
+@@ -0,0 +1,246 @@
++import 'dart:convert';
++
++import 'package:flutter/material.dart';
++import 'package:logging/logging.dart';
++import 'package:perfect_freehand/perfect_freehand.dart';
++import 'package:saber/data/prefs.dart';
++import 'package:saber/data/tools/highlighter.dart';
++import 'package:saber/data/tools/pen.dart';
++import 'package:saber/data/tools/pencil.dart';
++import 'package:saber/data/tools/shape_pen.dart';
++import 'package:sbn/tool_id.dart';
++
++/// 个人自用版：一组用户可以保存并在工具栏里快速套用的笔参数。
++///
++/// Preset JSON is stored as an opaque string in `stows.penPresets`
++/// (see [PenPresets.load] / [PenPresets.save]), so that this model can change
++/// without a stow codec migration.
++///
++/// The JSON format is:
++/// ```json
++/// {"v": 1, "presets": [
++///   {"n": "name", "t": "fountainPen", "c": 4278190080,
++///    "p": true, "o": {"s": 5}}
++/// ]}
++/// ```
++@immutable
++class PenPreset {
++  const new({
++    required this.name,
++    required this.toolId,
++    required this.color,
++    required this.pressureEnabled,
++    required this.options,
++  });
++
++  /// The maximum number of presets the user can save.
++  static const maxCount = 3;
++
++  /// The tools that can be saved as a preset.
++  /// Note that [ToolId] itself must not be modified,
++  /// since its values are stored in `.sbn2` files.
++  static const savableToolIds = [
++    ToolId.fountainPen,
++    ToolId.ballpointPen,
++    ToolId.shapePen,
++    ToolId.highlighter,
++    ToolId.pencil,
++  ];
++
++  final String name;
++  final ToolId toolId;
++  final Color color;
++  final bool pressureEnabled;
++  final StrokeOptions options;
++
++  double get size => options.size;
++
++  Map<String, dynamic> toJson() => {
++    'n': name,
++    't': toolId.id,
++    'c': color.toARGB32(),
++    'p': pressureEnabled,
++    'o': options.toJson(),
++  };
++
++  /// Returns null if [json] isn't a valid preset.
++  static PenPreset? fromJson(Map<String, dynamic> json) {
++    ToolId? toolId;
++    for (final candidate in savableToolIds) {
++      if (candidate.id == json['t']) {
++        toolId = candidate;
++        break;
++      }
++    }
++    final color = json['c'];
++    final options = json['o'];
++    if (toolId == null || color is! int || options is! Map) return null;
++
++    final name = json['n'];
++    return PenPreset(
++      name: name is String && name.isNotEmpty ? name : toolId.id,
++      toolId: toolId,
++      color: Color(color),
++      pressureEnabled: json['p'] == true,
++      options: StrokeOptions.fromJson(Map<String, dynamic>.from(options)),
++    );
++  }
++}
++
++/// 个人自用版：读写 [stows.penPresets] 里的笔预设。
++abstract class PenPresets {
++  static final log = Logger('PenPresets');
++
++  static const _version = 1;
++
++  /// The user's saved presets, in display order.
++  /// Never throws: invalid or corrupted data is treated as "no presets".
++  static List<PenPreset> load() {
++    final json = stows.penPresets.value;
++    if (json.isEmpty) return [];
++
++    try {
++      final decoded = jsonDecode(json);
++      if (decoded is! Map) return [];
++      final presets = decoded['presets'];
++      if (presets is! List) return [];
++
++      final result = <PenPreset>[];
++      for (final preset in presets) {
++        if (preset is! Map) continue;
++        final parsed = PenPreset.fromJson(Map<String, dynamic>.from(preset));
++        if (parsed != null && result.length < PenPreset.maxCount) {
++          result.add(parsed);
++        }
++      }
++      return result;
++    } catch (e, st) {
++      log.warning('Failed to parse pen presets', e, st);
++      return [];
++    }
++  }
++
++  static void save(List<PenPreset> presets) {
++    stows.penPresets.value = jsonEncode({
++      'v': _version,
++      'presets': presets.map((preset) => preset.toJson()).toList(),
++    });
++  }
++
++  /// Saves [preset], unless [PenPreset.maxCount] presets are already saved.
++  /// Returns the new list of presets, or null if the limit was reached.
++  static List<PenPreset>? add(PenPreset preset) {
++    final presets = load();
++    if (presets.length >= PenPreset.maxCount) return null;
++
++    presets.add(preset);
++    save(presets);
++    return presets;
++  }
++
++  static void removeAt(int index) {
++    final presets = load();
++    if (index < 0 || index >= presets.length) return;
++
++    presets.removeAt(index);
++    save(presets);
++  }
++
++  /// A snapshot of [pen]'s current settings.
++  static PenPreset fromPen(Pen pen, {required String name}) => PenPreset(
++    name: name,
++    toolId: pen.toolId,
++    color: pen.color,
++    pressureEnabled: pen.pressureEnabled,
++    // snapshot the options, so that later changes to [pen] don't change the preset
++    options: StrokeOptions.fromJson(pen.options.toJson()),
++  );
++
++  /// Returns a default name for a preset saved from [pen],
++  /// e.g. `钢笔 5`.
++  static String suggestName(Pen pen) {
++    final size = pen.options.size;
++    final prettySize = size == size.roundToDouble()
++        ? size.round().toString()
++        : size.toStringAsFixed(1);
++    return '${pen.name} $prettySize';
++  }
++
++  /// Creates (but doesn't select) the tool described by [preset],
++  /// and remembers it as the last used settings of that tool.
++  static Pen createPen(PenPreset preset) {
++    final Pen pen;
++    switch (preset.toolId) {
++      case .ballpointPen:
++        pen = Pen.ballpointPen();
++      case .shapePen:
++        pen = ShapePen();
++      case .highlighter:
++        pen = Highlighter();
++      case .pencil:
++        pen = Pencil();
++      case .fountainPen:
++      case .eraser:
++      case .select:
++      case .textEditing:
++      case .laserPointer:
++        pen = Pen.fountainPen();
++    }
++
++    pen.color = preset.color;
++    pen.pressureEnabled = preset.pressureEnabled;
++
++    // Copy the settings into the existing options object, rather than
++    // replacing it: that object is owned by [stows], which is what makes pen
++    // settings persist between sessions.
++    pen.options.applyFrom(preset.options);
++
++    _saveToPrefs(pen);
++    return pen;
++  }
++
++  /// Writes [pen]'s settings to [stows], so that the preset is remembered
++  /// as the last used settings for its tool.
++  static void _saveToPrefs(Pen pen) {
++    final colorStow = switch (pen.toolId) {
++      .fountainPen => stows.lastFountainPenColor,
++      .ballpointPen => stows.lastBallpointPenColor,
++      .shapePen => stows.lastShapePenColor,
++      .highlighter => stows.lastHighlighterColor,
++      .pencil => stows.lastPencilColor,
++      _ => null,
++    };
++    if (colorStow != null) colorStow.value = pen.color.toARGB32();
++
++    final optionsStow = switch (pen.toolId) {
++      .fountainPen => stows.lastFountainPenOptions,
++      .ballpointPen => stows.lastBallpointPenOptions,
++      .shapePen => stows.lastShapePenOptions,
++      .highlighter => stows.lastHighlighterOptions,
++      .pencil => stows.lastPencilOptions,
++      _ => null,
++    };
++    // the options object was mutated in place, so nothing would be written
++    // to disk without asking the stow to save
++    optionsStow?.notifyListeners();
++  }
++}
++
++extension _StrokeOptionsApplying on StrokeOptions {
++  /// Copies the values of [other] into this instance.
++  void applyFrom(StrokeOptions other) {
++    size = other.size;
++    thinning = other.thinning;
++    smoothing = other.smoothing;
++    streamline = other.streamline;
++    simulatePressure = other.simulatePressure;
++    start
++      ..cap = other.start.cap
++      ..taperEnabled = other.start.taperEnabled
++      ..customTaper = other.start.customTaper;
++    end
++      ..cap = other.end.cap
++      ..taperEnabled = other.end.taperEnabled
++      ..customTaper = other.end.customTaper;
++  }
++}
+diff --git a/lib/main.dart b/lib/main.dart
+index 3fd98b34..963f9d56 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -148,6 +148,8 @@ class const App({super.key}) extends StatefulWidget {
+         path: RoutePaths.logs,
+         builder: (context, state) => const LogsPage(),
+       ),
++      // 个人自用版：全文搜索页与回收站页
++      ...ExtraRoutes.routes,
+     ],
+   );
+ 
+diff --git a/lib/pages/editor/editor.dart b/lib/pages/editor/editor.dart
+index d7d7d278..db34cc15 100644
+--- a/lib/pages/editor/editor.dart
++++ b/lib/pages/editor/editor.dart
+@@ -49,7 +49,6 @@ import 'package:saber/data/tools/shape_pen.dart';
+ import 'package:saber/i18n/strings.g.dart';
+ import 'package:saber/pages/home/whiteboard.dart';
+ import 'package:sbn/change.dart';
+-import 'package:super_clipboard/super_clipboard.dart';
+ 
+ typedef _PhotoInfo = ({Uint8List bytes, String extension});
+ 
+@@ -1211,60 +1210,12 @@ class EditorState extends State<Editor> {
+     return true;
+   }
+ 
+-  Future paste() async {
+-    /// Maps image formats to their file extension.
+-    const Map<SimpleFileFormat, String> formats = {
+-      Formats.jpeg: '.jpeg',
+-      Formats.png: '.png',
+-      Formats.gif: '.gif',
+-      Formats.tiff: '.tiff',
+-      Formats.bmp: '.bmp',
+-      Formats.ico: '.ico',
+-      Formats.svg: '.svg',
+-      Formats.webp: '.webp',
+-    };
+-
+-    final reader = await SystemClipboard.instance?.read();
+-    if (reader == null) return;
+-
+-    final List<_PhotoInfo> photoInfos = [];
+-    final List<ReadProgress> progresses = [];
+-
+-    for (final format in formats.keys) {
+-      if (!reader.canProvide(format)) continue;
+-      final progress = reader.getFile(format, (file) async {
+-        final stream = file.getStream();
+-        final List<int> bytes = [];
+-        await for (final chunk in stream) {
+-          bytes.addAll(chunk);
+-        }
+-        if (bytes.isEmpty) {
+-          log.warning('Pasted empty file: $file (${formats[format]})');
+-          return;
+-        }
+-
+-        String extension;
+-        if (file.fileName != null) {
+-          extension = file.fileName!.substring(file.fileName!.lastIndexOf('.'));
+-        } else {
+-          extension = formats[format]!;
+-        }
+-
+-        photoInfos.add((
+-          bytes: Uint8List.fromList(bytes),
+-          extension: extension,
+-        ));
+-      });
+-      if (progress != null) progresses.add(progress);
+-    }
+-
+-    while (progresses.isNotEmpty) {
+-      progresses.removeWhere((progress) => progress.fraction.value == 1);
+-      await Future.delayed(const Duration(milliseconds: 50));
+-    }
+-
+-    await _pickPhotos(photoInfos);
+-  }
++  // NOTE (个人自用版): the clipboard image-paste helper used to live here.
++  // It relied on package:super_clipboard, whose Rust build hook required a
++  // rustup toolchain that this Android-only build does not need. The feature
++  // was only reachable through the desktop Ctrl+V keybinding, so removing it
++  // does not affect Android. Text pasting is still handled natively by the
++  // Quill text field.
+ 
+   Future exportAsPdf(BuildContext context) async {
+     final pdf = await EditorExporter.generatePdf(coreInfo, context);
+@@ -1323,6 +1274,29 @@ class EditorState extends State<Editor> {
+     }
+   }
+ 
++  /// 个人自用版：把笔记打字输入的文本导出为 Markdown。
++  ///
++  /// Handwritten strokes can't be turned into text, so they're only reported
++  /// in the exported file's header.
++  Future exportAsMarkdown(BuildContext context) async {
++    final markdown = EditorExporter.generateMarkdown(coreInfo);
++    await FileManager.exportFile(
++      '${coreInfo.fileName}.md',
++      Uint8List.fromList(utf8.encode(markdown)),
++      context: context,
++    );
++  }
++
++  /// 个人自用版：把笔记打字输入的文本导出为纯文本。
++  Future exportAsPlainText(BuildContext context) async {
++    final text = EditorExporter.generatePlainText(coreInfo);
++    await FileManager.exportFile(
++      '${coreInfo.fileName}.txt',
++      Uint8List.fromList(utf8.encode(text)),
++      context: context,
++    );
++  }
++
+   @override
+   Widget build(BuildContext context) {
+     final colorScheme = ColorScheme.of(context);
+@@ -1544,10 +1518,11 @@ class EditorState extends State<Editor> {
+             lastSeenPointerCount = 0;
+           },
+           pickPhoto: _pickPhotos,
+-          paste: paste,
+           exportAsSba: exportAsSba,
+           exportAsPdf: exportAsPdf,
+           exportAsPng: exportAsPng,
++          exportAsMarkdown: exportAsMarkdown,
++          exportAsPlainText: exportAsPlainText,
+         ),
+       ),
+     );
+diff --git a/lib/pages/home/recent_notes.dart b/lib/pages/home/recent_notes.dart
+index ec42b593..346f1577 100644
+--- a/lib/pages/home/recent_notes.dart
++++ b/lib/pages/home/recent_notes.dart
+@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
+ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:go_router/go_router.dart';
+ import 'package:logging/logging.dart';
++import 'package:saber/components/home/daily_note_button.dart';
+ import 'package:saber/components/home/delete_note_button.dart';
+ import 'package:saber/components/home/export_note_button.dart';
+ import 'package:saber/components/home/home_layout_button.dart';
+@@ -15,6 +16,7 @@ import 'package:saber/components/home/rename_note_button.dart';
+ import 'package:saber/components/home/welcome.dart';
+ import 'package:saber/components/theming/saber_theme.dart';
+ import 'package:saber/data/file_manager/file_manager.dart';
++import 'package:saber/data/file_manager/pinned_notes.dart';
+ import 'package:saber/data/prefs.dart';
+ import 'package:saber/data/routes.dart';
+ import 'package:saber/i18n/strings.g.dart';
+@@ -97,12 +99,12 @@ class _RecentPageState extends State<RecentPage> {
+ 
+     final children = await FileManager.getRecentlyAccessed();
+     filePaths.clear();
+-    if (children.isEmpty) {
+-      failed = true;
+-    } else {
+-      failed = false;
+-      filePaths.addAll(children);
++    // 个人自用版：置顶（收藏）的笔记排在最前面，即使它们已经不在最近列表里
++    filePaths.addAll(PinnedNotes.existingPinnedNotes());
++    for (final child in children) {
++      if (!filePaths.contains(child)) filePaths.add(child);
+     }
++    failed = filePaths.isEmpty;
+ 
+     if (mounted) setState(() {});
+   }
+@@ -113,6 +115,16 @@ class _RecentPageState extends State<RecentPage> {
+     final platform = Theme.of(context).platform;
+     final crossAxisCount = MediaQuery.sizeOf(context).width ~/ 300 + 1;
+     useListenable(stows.homeLayout);
++    useListenable(stows.pinnedFiles);
++
++    // 个人自用版：置顶（收藏）的笔记显示在最前面
++    final pinnedFiles = PinnedNotes.existingPinnedNotes();
++    final orderedFiles = pinnedFiles.isEmpty
++        ? filePaths
++        : <String>[
++            ...pinnedFiles,
++            ...filePaths.where((file) => !pinnedFiles.contains(file)),
++          ];
+ 
+     return Scaffold(
+       body: CustomScrollView(
+@@ -135,7 +147,21 @@ class _RecentPageState extends State<RecentPage> {
+                   bottom: 16,
+                 ),
+               ),
+-              actions: const [HomeLayoutButton()],
++              actions: [
++                // 个人自用版：每日笔记 / 全文搜索 / 回收站 入口（未走 i18n）
++                const DailyNoteButton(),
++                IconButton(
++                  tooltip: '全文搜索',
++                  onPressed: () => context.push(RoutePaths.search),
++                  icon: const Icon(Icons.search),
++                ),
++                IconButton(
++                  tooltip: '回收站',
++                  onPressed: () => context.push(RoutePaths.trash),
++                  icon: const Icon(Icons.restore_from_trash),
++                ),
++                const HomeLayoutButton(),
++              ],
+             ),
+           ),
+           if (failed) ...[
+@@ -148,7 +174,7 @@ class _RecentPageState extends State<RecentPage> {
+               ),
+               sliver: MasonryFiles(
+                 crossAxisCount: crossAxisCount,
+-                files: [for (final filePath in filePaths) filePath],
++                files: orderedFiles,
+                 selectedFiles: selectedFiles,
+               ),
+             ),
+diff --git a/lib/pages/home/search.dart b/lib/pages/home/search.dart
+new file mode 100644
+index 00000000..7dd653ea
+--- /dev/null
++++ b/lib/pages/home/search.dart
+@@ -0,0 +1,387 @@
++import 'dart:async';
++
++import 'package:flutter/material.dart';
++import 'package:go_router/go_router.dart';
++import 'package:saber/data/file_manager/file_manager.dart';
++import 'package:saber/data/file_manager/note_search.dart';
++import 'package:saber/data/routes.dart';
++import 'package:worker_manager/worker_manager.dart';
++
++/// 个人自用版：全文搜索页（标题 + 正文）。
++///
++/// 未走 i18n，UI 文案直接使用中文字面量。
++class const SearchPage({super.key}) extends StatefulWidget {
++  @override
++  State<SearchPage> createState() => _SearchPageState();
++}
++
++/// 个人自用版：一条搜索结果。
++class NoteSearchResult {
++  /// The note's path without its extension, as used by [RoutePaths.editFilePath].
++  final String filePath;
++
++  /// A snippet of the note's text around the match,
++  /// or `null` if the note matched by its title only.
++  final String? snippet;
++
++  const new(this.filePath, this.snippet);
++
++  String get title => filePath.substring(filePath.lastIndexOf('/') + 1);
++
++  String get parentDirectory {
++    final directory = filePath.substring(0, filePath.lastIndexOf('/'));
++    return directory.isEmpty ? '/' : directory;
++  }
++}
++
++class _SearchPageState extends State<SearchPage> {
++  final queryController = TextEditingController();
++  final results = <NoteSearchResult>[];
++
++  var allFiles = <String>[];
++  var isLoadingFiles = true;
++  var isSearchingBodies = false;
++  var scannedBodies = 0;
++  var totalBodies = 0;
++  var titleOnly = false;
++
++  /// Incremented whenever the query changes, so that in-flight scans know
++  /// that their results are no longer wanted.
++  var generation = 0;
++
++  final runningScans = <Cancelable<String?>>[];
++  StreamSubscription? fileWriteSubscription;
++  Timer? debounce;
++
++  static const _debounceDuration = Duration(milliseconds: 200);
++
++  /// How many notes are read at the same time. worker_manager queues the rest.
++  static const _scanConcurrency = 3;
++
++  @override
++  void initState() {
++    super.initState();
++    queryController.addListener(_onQueryChanged);
++    fileWriteSubscription = FileManager.fileWriteStream.stream.listen((_) {
++      findFiles();
++    });
++    findFiles();
++  }
++
++  @override
++  void dispose() {
++    debounce?.cancel();
++    _cancelScans();
++    fileWriteSubscription?.cancel();
++    queryController.removeListener(_onQueryChanged);
++    queryController.dispose();
++    super.dispose();
++  }
++
++  Future<void> findFiles() async {
++    final files = await FileManager.getAllFiles(includeExtensions: true);
++    if (!mounted) return;
++
++    allFiles = files;
++    isLoadingFiles = false;
++    await search(queryController.text);
++  }
++
++  void _onQueryChanged() {
++    debounce?.cancel();
++    _cancelScans();
++    if (mounted) setState(() => isSearchingBodies = false);
++    debounce = Timer(_debounceDuration, () => search(queryController.text));
++  }
++
++  void _cancelScans() {
++    for (final scan in runningScans) {
++      scan.cancel();
++    }
++    runningScans.clear();
++  }
++
++  void _setResults(List<NoteSearchResult> newResults) {
++    results
++      ..clear()
++      ..addAll(newResults);
++  }
++
++  Future<void> search(String rawQuery) async {
++    final query = rawQuery.trim().toLowerCase();
++    final thisGeneration = ++generation;
++    _cancelScans();
++
++    if (query.isEmpty) {
++      setState(() {
++        results.clear();
++        isSearchingBodies = false;
++        scannedBodies = 0;
++        totalBodies = 0;
++      });
++      return;
++    }
++
++    final titleMatches = <NoteSearchResult>[];
++    final bodyCandidates = <String>[];
++    for (final filePath in allFiles) {
++      final title = filePath.substring(filePath.lastIndexOf('/') + 1);
++      if (title.toLowerCase().contains(query)) {
++        titleMatches.add(NoteSearchResult(_withoutExtension(filePath), null));
++      } else {
++        bodyCandidates.add(filePath);
++      }
++    }
++
++    setState(() {
++      _setResults(titleMatches);
++      scannedBodies = 0;
++      totalBodies = titleOnly ? 0 : bodyCandidates.length;
++      isSearchingBodies = !titleOnly && bodyCandidates.isNotEmpty;
++    });
++
++    if (titleOnly || bodyCandidates.isEmpty) return;
++    await _searchBodies(
++      thisGeneration: thisGeneration,
++      query: query,
++      titleMatches: titleMatches,
++      candidates: bodyCandidates,
++    );
++  }
++
++  Future<void> _searchBodies({
++    required int thisGeneration,
++    required String query,
++    required List<NoteSearchResult> titleMatches,
++    required List<String> candidates,
++  }) async {
++    final bodyMatches = <NoteSearchResult>[];
++    var next = 0;
++    var done = 0;
++    var shownResults = 0;
++
++    Future<void> worker() async {
++      while (thisGeneration == generation && next < candidates.length) {
++        final filePath = candidates[next];
++        next++;
++
++        final scan = NoteSearch.readPlainText(filePath);
++        runningScans.add(scan);
++
++        String? text;
++        try {
++          text = await scan;
++        } on CanceledError {
++          return;
++        } catch (_) {
++          text = null;
++        }
++        if (thisGeneration != generation) return;
++
++        done++;
++        if (text != null) {
++          final snippet = NoteSearch.makeSnippet(text, query);
++          if (snippet != null) {
++            bodyMatches.add(
++              NoteSearchResult(_withoutExtension(filePath), snippet),
++            );
++          }
++        }
++
++        final isFinished = done == candidates.length;
++        final hasNewResults = bodyMatches.length != shownResults;
++        if (mounted && (hasNewResults || isFinished || done % 4 == 0)) {
++          shownResults = bodyMatches.length;
++          setState(() {
++            _setResults([...titleMatches, ...bodyMatches]);
++            scannedBodies = done;
++          });
++        }
++      }
++    }
++
++    await Future.wait([
++      for (int i = 0; i < _scanConcurrency; i++) worker(),
++    ]);
++    _cancelScans();
++    if (thisGeneration != generation || !mounted) return;
++
++    setState(() {
++      isSearchingBodies = false;
++      scannedBodies = candidates.length;
++      _setResults([...titleMatches, ...bodyMatches]);
++    });
++  }
++
++  String _withoutExtension(String filePath) {
++    for (final extension in ['.sbn2', '.sbn']) {
++      if (filePath.endsWith(extension)) {
++        return filePath.substring(0, filePath.length - extension.length);
++      }
++    }
++    return filePath;
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final query = queryController.text.trim();
++
++    return Scaffold(
++      appBar: AppBar(
++        title: TextField(
++          controller: queryController,
++          autofocus: true,
++          textInputAction: .search,
++          decoration: const InputDecoration(
++            border: .none,
++            // 个人自用版：未走 i18n
++            hintText: '搜索笔记标题与正文',
++          ),
++        ),
++        actions: [
++          if (query.isNotEmpty)
++            IconButton(
++              tooltip: '清除', // 个人自用版：未走 i18n
++              onPressed: queryController.clear,
++              icon: const Icon(Icons.close),
++            ),
++          const SizedBox(width: 8),
++        ],
++      ),
++      body: Column(
++        children: [
++          Padding(
++            padding: const .symmetric(horizontal: 8),
++            child: Row(
++              children: [
++                FilterChip(
++                  // 个人自用版：未走 i18n
++                  label: const Text('仅搜标题'),
++                  selected: titleOnly,
++                  onSelected: (selected) {
++                    setState(() => titleOnly = selected);
++                    search(queryController.text);
++                  },
++                ),
++                const Spacer(),
++                if (isSearchingBodies)
++                  Expanded(
++                    flex: 3,
++                    child: Row(
++                      mainAxisAlignment: .end,
++                      children: [
++                        Flexible(
++                          child: Text(
++                            // 个人自用版：未走 i18n
++                            '正在搜索正文 $scannedBodies/$totalBodies',
++                            style: TextTheme.of(context).bodySmall,
++                            overflow: .ellipsis,
++                          ),
++                        ),
++                        const SizedBox(width: 8),
++                        const SizedBox(
++                          width: 90,
++                          child: LinearProgressIndicator(),
++                        ),
++                      ],
++                    ),
++                  ),
++              ],
++            ),
++          ),
++          Expanded(child: _buildBody(query)),
++        ],
++      ),
++    );
++  }
++
++  Widget _buildBody(String query) {
++    if (isLoadingFiles) {
++      return const Center(child: CircularProgressIndicator());
++    }
++    if (query.isEmpty) {
++      // 个人自用版：未走 i18n
++      return const _SearchHint(text: '输入关键字，搜索所有笔记的标题与正文');
++    }
++    if (results.isEmpty && !isSearchingBodies) {
++      // 个人自用版：未走 i18n
++      return const _SearchHint(text: '没有找到匹配的笔记');
++    }
++
++    return ListView.builder(
++      itemCount: results.length,
++      itemBuilder: (context, index) {
++        final result = results[index];
++        return ListTile(
++          leading: const Icon(Icons.article_outlined),
++          title: _HighlightedText(text: result.title, query: query),
++          subtitle: Column(
++            crossAxisAlignment: .start,
++            children: [
++              Text(
++                result.parentDirectory,
++                style: TextTheme.of(context).bodySmall,
++              ),
++              if (result.snippet != null)
++                _HighlightedText(
++                  text: result.snippet!,
++                  query: query,
++                  maxLines: 2,
++                ),
++            ],
++          ),
++          onTap: () => context.push(RoutePaths.editFilePath(result.filePath)),
++        );
++      },
++    );
++  }
++}
++
++class const _SearchHint({required final String text}) extends StatelessWidget {
++  @override
++  Widget build(BuildContext context) {
++    return Center(
++      child: Padding(
++        padding: const .all(32),
++        child: Text(
++          text,
++          textAlign: .center,
++          style: TextTheme.of(context).bodyLarge?.copyWith(
++            color: ColorScheme.of(context).onSurfaceVariant,
++          ),
++        ),
++      ),
++    );
++  }
++}
++
++/// 个人自用版：把 [query] 的命中部分加粗高亮。
++class const _HighlightedText({
++  required final String text,
++  required final String query,
++  final int maxLines = 1,
++}) extends StatelessWidget {
++  @override
++  Widget build(BuildContext context) {
++    final index = text.toLowerCase().indexOf(query.toLowerCase());
++    if (index == -1) {
++      return Text(text, maxLines: maxLines, overflow: .ellipsis);
++    }
++
++    final colorScheme = ColorScheme.of(context);
++    return Text.rich(
++      TextSpan(
++        children: [
++          TextSpan(text: text.substring(0, index)),
++          TextSpan(
++            text: text.substring(index, index + query.length),
++            style: TextStyle(color: colorScheme.primary, fontWeight: .bold),
++          ),
++          TextSpan(text: text.substring(index + query.length)),
++        ],
++      ),
++      maxLines: maxLines,
++      overflow: .ellipsis,
++    );
++  }
++}
+diff --git a/lib/pages/home/settings.dart b/lib/pages/home/settings.dart
+index 97727ddb..7ef9537c 100644
+--- a/lib/pages/home/settings.dart
++++ b/lib/pages/home/settings.dart
+@@ -548,6 +548,19 @@ class _SettingsPageState extends State<SettingsPage> {
+                       }
+                     },
+                   ),
++                // 个人自用版：全文搜索与回收站入口（未走 i18n）
++                SettingsButton(
++                  title: '全文搜索',
++                  subtitle: '搜索所有笔记的标题与正文',
++                  icon: Icons.search,
++                  onPressed: () => context.push(RoutePaths.search),
++                ),
++                SettingsButton(
++                  title: '回收站',
++                  subtitle: '恢复或彻底删除已删除的笔记',
++                  icon: Icons.restore_from_trash,
++                  onPressed: () => context.push(RoutePaths.trash),
++                ),
+                 SettingsButton(
+                   title: t.logs.viewLogs,
+                   subtitle: t.logs.debuggingInfo,
+diff --git a/lib/pages/home/trash.dart b/lib/pages/home/trash.dart
+new file mode 100644
+index 00000000..049be48b
+--- /dev/null
++++ b/lib/pages/home/trash.dart
+@@ -0,0 +1,181 @@
++import 'package:flutter/material.dart';
++import 'package:intl/intl.dart';
++import 'package:saber/data/file_manager/file_manager.dart';
++
++/// 个人自用版：回收站页面（未走 i18n，文案直接使用中文字面量）。
++class const TrashPage({super.key}) extends StatefulWidget {
++  @override
++  State<TrashPage> createState() => _TrashPageState();
++}
++
++class _TrashPageState extends State<TrashPage> {
++  List<TrashedNote>? notes;
++  var isBusy = false;
++
++  static final dateFormat = DateFormat('yyyy-MM-dd HH:mm');
++
++  @override
++  void initState() {
++    super.initState();
++    refresh();
++  }
++
++  Future<void> refresh() async {
++    final trashedNotes = await FileManager.listTrashedNotes();
++    if (!mounted) return;
++    setState(() => notes = trashedNotes);
++  }
++
++  void showMessage(String message) {
++    ScaffoldMessenger.of(
++      context,
++    ).showSnackBar(SnackBar(content: Text(message)));
++  }
++
++  Future<void> restore(TrashedNote note) async {
++    setState(() => isBusy = true);
++    try {
++      final restoredPath = await FileManager.restoreFromTrash(note.trashPath);
++      await refresh();
++      showMessage('已恢复到 $restoredPath');
++    } catch (e) {
++      showMessage('恢复失败：$e');
++    } finally {
++      if (mounted) setState(() => isBusy = false);
++    }
++  }
++
++  Future<void> deleteForever(TrashedNote note) async {
++    final confirmed = await _confirm(
++      title: '彻底删除这条笔记？',
++      message: '${note.title}\n此操作无法撤销。',
++      confirmLabel: '彻底删除',
++    );
++    if (confirmed != true) return;
++
++    setState(() => isBusy = true);
++    try {
++      await FileManager.permanentlyDeleteFromTrash(note.trashPath);
++      await refresh();
++      showMessage('已彻底删除');
++    } finally {
++      if (mounted) setState(() => isBusy = false);
++    }
++  }
++
++  Future<void> emptyTrash() async {
++    final noteCount = notes?.length ?? 0;
++    final confirmed = await _confirm(
++      title: '清空回收站？',
++      message: '将彻底删除回收站中的 $noteCount 条笔记，此操作无法撤销。',
++      confirmLabel: '清空',
++    );
++    if (confirmed != true) return;
++
++    setState(() => isBusy = true);
++    try {
++      await FileManager.emptyTrash();
++      await refresh();
++      showMessage('回收站已清空');
++    } finally {
++      if (mounted) setState(() => isBusy = false);
++    }
++  }
++
++  Future<bool?> _confirm({
++    required String title,
++    required String message,
++    required String confirmLabel,
++  }) {
++    return showDialog<bool>(
++      context: context,
++      builder: (context) => AlertDialog(
++        title: Text(title),
++        content: Text(message),
++        actions: [
++          TextButton(
++            onPressed: () => Navigator.of(context).pop(false),
++            child: const Text('取消'),
++          ),
++          TextButton(
++            onPressed: () => Navigator.of(context).pop(true),
++            child: Text(confirmLabel),
++          ),
++        ],
++      ),
++    );
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final trashedNotes = notes;
++
++    return Scaffold(
++      appBar: AppBar(
++        title: const Text('回收站'),
++        actions: [
++          IconButton(
++            tooltip: '清空回收站',
++            onPressed: (trashedNotes == null || trashedNotes.isEmpty || isBusy)
++                ? null
++                : emptyTrash,
++            icon: const Icon(Icons.delete_sweep),
++          ),
++          const SizedBox(width: 8),
++        ],
++      ),
++      body: switch (trashedNotes) {
++        null => const Center(child: CircularProgressIndicator()),
++        [] => const Center(
++          child: Padding(
++            padding: .all(32),
++            child: Text('回收站是空的', textAlign: .center),
++          ),
++        ),
++        _ => Stack(
++          children: [
++            ListView.separated(
++              padding: const .only(bottom: 32),
++              itemCount: trashedNotes.length,
++              separatorBuilder: (context, index) => const Divider(height: 1),
++              itemBuilder: (context, index) {
++                final note = trashedNotes[index];
++                return ListTile(
++                  leading: const Icon(Icons.restore_from_trash),
++                  title: Text(note.title, maxLines: 1, overflow: .ellipsis),
++                  subtitle: Text(
++                    '原位置：${note.parentDirectory}\n'
++                    '删除于：${dateFormat.format(note.deletedAt)}',
++                  ),
++                  isThreeLine: true,
++                  trailing: Row(
++                    mainAxisSize: .min,
++                    children: [
++                      IconButton(
++                        tooltip: '恢复',
++                        onPressed: isBusy ? null : () => restore(note),
++                        icon: const Icon(Icons.restore),
++                      ),
++                      IconButton(
++                        tooltip: '彻底删除',
++                        onPressed: isBusy ? null : () => deleteForever(note),
++                        icon: const Icon(Icons.delete_forever),
++                      ),
++                    ],
++                  ),
++                );
++              },
++            ),
++            if (isBusy)
++              const Positioned(
++                top: 0,
++                left: 0,
++                right: 0,
++                child: LinearProgressIndicator(),
++              ),
++          ],
++        ),
++      },
++    );
++  }
++}
+diff --git a/linux/flutter/generated_plugin_registrant.cc b/linux/flutter/generated_plugin_registrant.cc
+index 7440c302..a15d610d 100644
+--- a/linux/flutter/generated_plugin_registrant.cc
++++ b/linux/flutter/generated_plugin_registrant.cc
+@@ -10,10 +10,8 @@
+ #include <file_selector_linux/file_selector_plugin.h>
+ #include <flutter_secure_storage_linux/flutter_secure_storage_linux_plugin.h>
+ #include <gtk/gtk_plugin.h>
+-#include <irondash_engine_context/irondash_engine_context_plugin.h>
+ #include <printing/printing_plugin.h>
+ #include <screen_retriever_linux/screen_retriever_linux_plugin.h>
+-#include <super_native_extensions/super_native_extensions_plugin.h>
+ #include <url_launcher_linux/url_launcher_plugin.h>
+ #include <window_manager/window_manager_plugin.h>
+ #include <yaru_window_linux/yaru_window_linux_plugin.h>
+@@ -31,18 +29,12 @@ void fl_register_plugins(FlPluginRegistry* registry) {
+   g_autoptr(FlPluginRegistrar) gtk_registrar =
+       fl_plugin_registry_get_registrar_for_plugin(registry, "GtkPlugin");
+   gtk_plugin_register_with_registrar(gtk_registrar);
+-  g_autoptr(FlPluginRegistrar) irondash_engine_context_registrar =
+-      fl_plugin_registry_get_registrar_for_plugin(registry, "IrondashEngineContextPlugin");
+-  irondash_engine_context_plugin_register_with_registrar(irondash_engine_context_registrar);
+   g_autoptr(FlPluginRegistrar) printing_registrar =
+       fl_plugin_registry_get_registrar_for_plugin(registry, "PrintingPlugin");
+   printing_plugin_register_with_registrar(printing_registrar);
+   g_autoptr(FlPluginRegistrar) screen_retriever_linux_registrar =
+       fl_plugin_registry_get_registrar_for_plugin(registry, "ScreenRetrieverLinuxPlugin");
+   screen_retriever_linux_plugin_register_with_registrar(screen_retriever_linux_registrar);
+-  g_autoptr(FlPluginRegistrar) super_native_extensions_registrar =
+-      fl_plugin_registry_get_registrar_for_plugin(registry, "SuperNativeExtensionsPlugin");
+-  super_native_extensions_plugin_register_with_registrar(super_native_extensions_registrar);
+   g_autoptr(FlPluginRegistrar) url_launcher_linux_registrar =
+       fl_plugin_registry_get_registrar_for_plugin(registry, "UrlLauncherPlugin");
+   url_launcher_plugin_register_with_registrar(url_launcher_linux_registrar);
+diff --git a/linux/flutter/generated_plugins.cmake b/linux/flutter/generated_plugins.cmake
+index 9a00d9d0..f488cfd5 100644
+--- a/linux/flutter/generated_plugins.cmake
++++ b/linux/flutter/generated_plugins.cmake
+@@ -7,10 +7,8 @@ list(APPEND FLUTTER_PLUGIN_LIST
+   file_selector_linux
+   flutter_secure_storage_linux
+   gtk
+-  irondash_engine_context
+   printing
+   screen_retriever_linux
+-  super_native_extensions
+   url_launcher_linux
+   window_manager
+   yaru_window_linux
+diff --git a/macos/Flutter/GeneratedPluginRegistrant.swift b/macos/Flutter/GeneratedPluginRegistrant.swift
+index 35223fa3..b99ec0c1 100644
+--- a/macos/Flutter/GeneratedPluginRegistrant.swift
++++ b/macos/Flutter/GeneratedPluginRegistrant.swift
+@@ -9,14 +9,12 @@ import device_info_plus
+ import dynamic_color
+ import file_picker_darwin
+ import flutter_secure_storage_darwin
+-import irondash_engine_context
+ import pdfium_flutter
+ import printing
+ import quill_native_bridge_macos
+ import screen_retriever_macos
+ import share_plus
+ import shared_preferences_foundation
+-import super_native_extensions
+ import url_launcher_macos
+ import window_manager
+ 
+@@ -25,14 +23,12 @@ func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
+   DynamicColorPlugin.register(with: registry.registrar(forPlugin: "DynamicColorPlugin"))
+   FilePickerPlugin.register(with: registry.registrar(forPlugin: "FilePickerPlugin"))
+   FlutterSecureStorageDarwinPlugin.register(with: registry.registrar(forPlugin: "FlutterSecureStorageDarwinPlugin"))
+-  IrondashEngineContextPlugin.register(with: registry.registrar(forPlugin: "IrondashEngineContextPlugin"))
+   PDFiumFlutterPlugin.register(with: registry.registrar(forPlugin: "PDFiumFlutterPlugin"))
+   PrintingPlugin.register(with: registry.registrar(forPlugin: "PrintingPlugin"))
+   QuillNativeBridgePlugin.register(with: registry.registrar(forPlugin: "QuillNativeBridgePlugin"))
+   ScreenRetrieverMacosPlugin.register(with: registry.registrar(forPlugin: "ScreenRetrieverMacosPlugin"))
+   SharePlusMacosPlugin.register(with: registry.registrar(forPlugin: "SharePlusMacosPlugin"))
+   SharedPreferencesPlugin.register(with: registry.registrar(forPlugin: "SharedPreferencesPlugin"))
+-  SuperNativeExtensionsPlugin.register(with: registry.registrar(forPlugin: "SuperNativeExtensionsPlugin"))
+   UrlLauncherPlugin.register(with: registry.registrar(forPlugin: "UrlLauncherPlugin"))
+   WindowManagerPlugin.register(with: registry.registrar(forPlugin: "WindowManagerPlugin"))
+ }
+diff --git a/pubspec.lock b/pubspec.lock
+index 8a96a731..b80228b3 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -709,22 +709,6 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "0.20.3"
+-  irondash_engine_context:
+-    dependency: transitive
+-    description:
+-      name: irondash_engine_context
+-      sha256: eccd423b2e6b821338fc3c0bf4d12192cff7a4a3f5c66c6abc704f25aa3886b1
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "0.6.0-dev.0"
+-  irondash_message_channel:
+-    dependency: transitive
+-    description:
+-      name: irondash_message_channel
+-      sha256: "247e07d6b8694d9fd2c372832a6c5ef057298aa9a52ed4d74861c064096ee1ab"
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "0.8.0-dev.0"
+   is_ios_simulator:
+     dependency: transitive
+     description:
+@@ -1108,14 +1092,6 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "7.0.2"
+-  pixel_snap:
+-    dependency: transitive
+-    description:
+-      name: pixel_snap
+-      sha256: "677410ea37b07cd37ecb6d5e6c0d8d7615a7cf3bd92ba406fd1ac57e937d1fb0"
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "0.1.5"
+   platform:
+     dependency: transitive
+     description:
+@@ -1544,22 +1520,6 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.4.1"
+-  super_clipboard:
+-    dependency: "direct main"
+-    description:
+-      name: super_clipboard
+-      sha256: "9c6a698aa85258a9860123a30802ad5a5c82852008244c5e6c4f589559298da2"
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "0.10.0-dev.2"
+-  super_native_extensions:
+-    dependency: transitive
+-    description:
+-      name: super_native_extensions
+-      sha256: cb633ce1150acb2c43e3457f2659a06a77f620f125bf73e15b9217483faf9ec3
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "0.10.0-dev.2"
+   sync_http:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 2dec2cac..4045eb70 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -109,8 +109,6 @@ dependencies:
+ 
+   printing: ^5.13.2
+ 
+-  super_clipboard: ^0.10.0-dev.2
+-
+   fast_image_resizer: ^0.0.2
+ 
+   bson: ^5.0.0
+diff --git a/test/editor_text_export_test.dart b/test/editor_text_export_test.dart
+new file mode 100644
+index 00000000..5e3aabe7
+--- /dev/null
++++ b/test/editor_text_export_test.dart
+@@ -0,0 +1,139 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_quill/flutter_quill.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:perfect_freehand/perfect_freehand.dart';
++import 'package:saber/components/canvas/_stroke.dart';
++import 'package:saber/data/editor/editor_core_info.dart';
++import 'package:saber/data/editor/editor_exporter.dart';
++import 'package:saber/data/editor/page.dart';
++
++void main() {
++  test('QuillToMarkdown converts the common inline and block styles', () {
++    final markdown = EditorExporter.generateMarkdown(
++      _coreInfoWithDocument(
++        '/Notes/Test',
++        Document.fromJson([
++          {'insert': 'Title'},
++          {
++            'insert': '\n',
++            'attributes': {'header': 1},
++          },
++          {'insert': 'plain '},
++          {
++            'insert': 'bold',
++            'attributes': {'bold': true},
++          },
++          {'insert': ' and '},
++          {
++            'insert': 'italic',
++            'attributes': {'italic': true},
++          },
++          {'insert': ' '},
++          {
++            'insert': 'link',
++            'attributes': {'link': 'https://example.com'},
++          },
++          {'insert': '\n'},
++          {'insert': 'one'},
++          {
++            'insert': '\n',
++            'attributes': {'list': 'ordered'},
++          },
++          {'insert': 'two'},
++          {
++            'insert': '\n',
++            'attributes': {'list': 'bullet'},
++          },
++          {'insert': 'quote'},
++          {
++            'insert': '\n',
++            'attributes': {'blockquote': true},
++          },
++          {'insert': 'code'},
++          {
++            'insert': '\n',
++            'attributes': {'code-block': true},
++          },
++          {'insert': 'print(1)'},
++          {'insert': '\n'},
++          {'insert': 'after'},
++          {'insert': '\n'},
++        ]),
++      ),
++    );
++
++    expect(markdown, startsWith('# Test\n'));
++    expect(markdown, contains('\nplain **bold** and *italic* [link]('));
++    expect(markdown, contains('https://example.com)'));
++    expect(markdown, contains('\n1. one\n'));
++    expect(markdown, contains('\n- two\n'));
++    expect(markdown, contains('\n> quote\n'));
++    expect(markdown, contains('```\ncode\n```\n'));
++    expect(markdown, contains('\nprint(1)\n'));
++    expect(markdown, endsWith('\nafter\n'));
++  });
++
++  test('Exporting text reports handwriting that cannot be converted', () {
++    final coreInfo = EditorCoreInfo(filePath: '/Notes/Doodle');
++    final page = EditorPage();
++    page.strokes.add(
++      Stroke(
++        color: Colors.black,
++        pressureEnabled: false,
++        options: StrokeOptions(size: 5),
++        pageIndex: 0,
++        page: page,
++        toolId: .fountainPen,
++      ),
++    );
++    coreInfo.pages.add(page);
++
++    final markdown = EditorExporter.generateMarkdown(coreInfo);
++    expect(markdown, startsWith('# Doodle\n'));
++    expect(markdown, contains('本笔记含手写/图片内容（共 1 笔、0 张图片）'));
++    expect(markdown, contains('（本页没有文本内容）'));
++    expect(markdown, contains('本页还有 1 笔手写、0 张图片'));
++    expect(markdown, isNot(contains('## 第')));
++
++    final plainText = EditorExporter.generatePlainText(coreInfo);
++    expect(plainText, startsWith('Doodle\n======\n'));
++    expect(plainText, contains('未包含在文本导出中'));
++    expect(plainText, isNot(contains('>')));
++  });
++
++  test('Plain text export has no markdown markup', () {
++    final plainText = EditorExporter.generatePlainText(
++      _coreInfoWithDocument(
++        '/Notes/Plain',
++        Document.fromJson([
++          {'insert': 'Hello '},
++          {
++            'insert': 'world',
++            'attributes': {'bold': true},
++          },
++          {'insert': '\n'},
++        ]),
++      ),
++    );
++
++    expect(plainText, startsWith('Plain\n=====\n'));
++    expect(plainText, contains('Hello world'));
++    expect(plainText, isNot(contains('**')));
++  });
++}
++
++EditorCoreInfo _coreInfoWithDocument(String filePath, Document document) {
++  final coreInfo = EditorCoreInfo(filePath: filePath);
++  coreInfo.pages.add(
++    EditorPage(
++      quill: QuillStruct(
++        controller: QuillController(
++          document: document,
++          selection: const TextSelection.collapsed(offset: 0),
++        ),
++        focusNode: FocusNode(debugLabel: 'Text export test'),
++      ),
++    ),
++  );
++  return coreInfo;
++}
+diff --git a/test/pen_presets_test.dart b/test/pen_presets_test.dart
+new file mode 100644
+index 00000000..b0d90b8d
+--- /dev/null
++++ b/test/pen_presets_test.dart
+@@ -0,0 +1,67 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:perfect_freehand/perfect_freehand.dart';
++import 'package:saber/data/prefs.dart';
++import 'package:saber/data/tools/pen_presets.dart';
++import 'package:sbn/tool_id.dart';
++
++void main() {
++  test('PenPresets round trips through stows.penPresets', () {
++    PenPresets.save([]);
++    expect(PenPresets.load(), isEmpty);
++
++    final saved = PenPresets.add(
++      PenPreset(
++        name: '红笔',
++        toolId: .fountainPen,
++        color: const Color(0xFFD32F2F),
++        pressureEnabled: true,
++        options: StrokeOptions(size: 7, thinning: 0.3),
++      ),
++    );
++
++    expect(saved, isNotNull);
++    expect(saved!.length, 1);
++
++    final loaded = PenPresets.load();
++    expect(loaded.length, 1);
++    expect(loaded.single.name, '红笔');
++    expect(loaded.single.toolId, ToolId.fountainPen);
++    expect(loaded.single.color.toARGB32(), 0xFFD32F2F);
++    expect(loaded.single.pressureEnabled, isTrue);
++    expect(loaded.single.options.size, 7);
++    expect(loaded.single.options.thinning, 0.3);
++  });
++
++  test('PenPresets refuses to save more than PenPreset.maxCount presets', () {
++    PenPresets.save([]);
++
++    for (var i = 0; i < PenPreset.maxCount; i++) {
++      expect(_add('p$i'), isNotNull, reason: 'preset $i should be saved');
++    }
++    expect(PenPresets.load().length, PenPreset.maxCount);
++    expect(_add('too many'), isNull);
++
++    PenPresets.removeAt(0);
++    expect(PenPresets.load(), hasLength(PenPreset.maxCount - 1));
++    expect(_add('p3'), isNotNull);
++  });
++
++  test('PenPresets ignores corrupted data', () {
++    stows.penPresets.value = 'not json';
++    expect(PenPresets.load(), isEmpty);
++
++    stows.penPresets.value = '{"v":1,"presets":[{"t":"nonsense"},42]}';
++    expect(PenPresets.load(), isEmpty);
++  });
++}
++
++PenPreset _preset(String name) => PenPreset(
++  name: name,
++  toolId: .ballpointPen,
++  color: Colors.black,
++  pressureEnabled: false,
++  options: StrokeOptions(size: 3),
++);
++
++List<PenPreset>? _add(String name) => PenPresets.add(_preset(name));
+diff --git a/windows/flutter/generated_plugin_registrant.cc b/windows/flutter/generated_plugin_registrant.cc
+index 5c19432f..ea6b64e7 100644
+--- a/windows/flutter/generated_plugin_registrant.cc
++++ b/windows/flutter/generated_plugin_registrant.cc
+@@ -9,12 +9,10 @@
+ #include <dynamic_color/dynamic_color_plugin_c_api.h>
+ #include <file_selector_windows/file_selector_windows.h>
+ #include <flutter_secure_storage_windows/flutter_secure_storage_windows_plugin.h>
+-#include <irondash_engine_context/irondash_engine_context_plugin_c_api.h>
+ #include <permission_handler_windows/permission_handler_windows_plugin.h>
+ #include <printing/printing_plugin.h>
+ #include <screen_retriever_windows/screen_retriever_windows_plugin_c_api.h>
+ #include <share_plus/share_plus_windows_plugin_c_api.h>
+-#include <super_native_extensions/super_native_extensions_plugin_c_api.h>
+ #include <url_launcher_windows/url_launcher_windows.h>
+ #include <window_manager/window_manager_plugin.h>
+ 
+@@ -25,8 +23,6 @@ void RegisterPlugins(flutter::PluginRegistry* registry) {
+       registry->GetRegistrarForPlugin("FileSelectorWindows"));
+   FlutterSecureStorageWindowsPluginRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("FlutterSecureStorageWindowsPlugin"));
+-  IrondashEngineContextPluginCApiRegisterWithRegistrar(
+-      registry->GetRegistrarForPlugin("IrondashEngineContextPluginCApi"));
+   PermissionHandlerWindowsPluginRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("PermissionHandlerWindowsPlugin"));
+   PrintingPluginRegisterWithRegistrar(
+@@ -35,8 +31,6 @@ void RegisterPlugins(flutter::PluginRegistry* registry) {
+       registry->GetRegistrarForPlugin("ScreenRetrieverWindowsPluginCApi"));
+   SharePlusWindowsPluginCApiRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("SharePlusWindowsPluginCApi"));
+-  SuperNativeExtensionsPluginCApiRegisterWithRegistrar(
+-      registry->GetRegistrarForPlugin("SuperNativeExtensionsPluginCApi"));
+   UrlLauncherWindowsRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("UrlLauncherWindows"));
+   WindowManagerPluginRegisterWithRegistrar(
+diff --git a/windows/flutter/generated_plugins.cmake b/windows/flutter/generated_plugins.cmake
+index 4dfc35aa..da4bef26 100644
+--- a/windows/flutter/generated_plugins.cmake
++++ b/windows/flutter/generated_plugins.cmake
+@@ -6,12 +6,10 @@ list(APPEND FLUTTER_PLUGIN_LIST
+   dynamic_color
+   file_selector_windows
+   flutter_secure_storage_windows
+-  irondash_engine_context
+   permission_handler_windows
+   printing
+   screen_retriever_windows
+   share_plus
+-  super_native_extensions
+   url_launcher_windows
+   window_manager
+ )

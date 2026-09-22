@@ -1,0 +1,639 @@
+From 22de6025cb8eb1779fc6046b22785180b099e1bf Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 12:36:01 +0800
+Subject: [PATCH 11/14] =?UTF-8?q?feat(image):=20=E5=8A=A8=E4=BD=9C?=
+ =?UTF-8?q?=E6=9D=A1=E5=8A=A0=E4=B8=8A=E5=A4=8D=E5=88=B6=E4=B8=80=E4=BB=BD?=
+ =?UTF-8?q?=E3=80=81=E7=BD=AE=E9=A1=B6/=E7=BD=AE=E5=BA=95=E3=80=81?=
+ =?UTF-8?q?=E5=8F=8D=E8=89=B2=EF=BC=88=E7=9C=9F=E6=AD=A3=E7=94=9F=E6=95=88?=
+ =?UTF-8?q?=E7=9A=84=E9=82=A3=E7=A7=8D=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+沿用上一批"选中图片→图片下方动作条"的入口，补齐用户点名的几项。
+现在动作条最多是：裁剪 / 重置裁剪 / 反色 / 置顶 / 置底 / 复制一份 / 删除。
+
+反色——这里做的是**真正的反色**，不是把长按菜单那个开关搬过来：
+长按菜单里的 invertible 是"深色模式下**不要**自动反色"的退出开关，
+只在深色模式下才看得出效果（这正是反馈"反色没效果"的原因）。
+新增 EditorImage.forceInvert 表示"不管主题明暗永远反色"，
+渲染条件变成 forceInvert 或 自动反色命中深色模式，两者正交。
+
+- 序列化：toJson 只在 true 时写 'fi'（免得把每份老笔记都改一遍），
+  fromJson 三个子类都补了读回；copy() 里传递
+- 新增 test/image_force_invert_test.dart 做 toJson 到 fromJson 的往返，
+  专门防"存了没读回来"这类静默失效（4 例）
+
+复制一份：
+- image.copy() 之后必须换一个新 id —— CanvasImage 的 key 用到了 id，
+  同一页出现两个相同 id 会撞 key（跨页相同没问题，因为不同 Stack）
+- 偏移 (20,20) 错开一点，追加到列表末尾（渲染顺序等于列表顺序，所以新的在上面）
+- 走 .draw 撤销类型，和"插入图片"同一条路径
+
+置顶/置底：
+- 图片的渲染顺序就是 page.images 的顺序，所以改层级等于改下标
+- EditorHistoryItem 新增 reorderImage 类型加 Change<int> imageOrderChange
+  （previous/current 下标），undo/redo 两个 switch 都补了分支
+- 只有一页上多于一张图时才显示这两个按钮（CanvasImage 新增
+  imageCountOnPage 参数，由 InnerCanvas 传入）
+
+新增 EditorImageAction 枚举加 EditorImage.onImageAction 回调：
+三个操作合成一个回调，避免再往三个子类的构造/fromJson/copy 里各加一个参数。
+---
+ lib/components/canvas/canvas_image.dart       | 74 +++++++++++++++-
+ lib/components/canvas/image/editor_image.dart | 20 +++++
+ .../canvas/image/pdf_editor_image.dart        |  6 +-
+ .../canvas/image/png_editor_image.dart        |  6 +-
+ .../canvas/image/svg_editor_image.dart        |  6 +-
+ lib/components/canvas/inner_canvas.dart       |  2 +
+ lib/data/editor/editor_history.dart           | 15 ++++
+ lib/pages/editor/editor.dart                  | 88 +++++++++++++++++++
+ test/image_force_invert_test.dart             | 62 +++++++++++++
+ 9 files changed, 275 insertions(+), 4 deletions(-)
+ create mode 100644 test/image_force_invert_test.dart
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index 2a172820..6b053bb4 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -22,6 +22,7 @@ class CanvasImage extends StatefulHookWidget {
+     this.isBackground = false,
+     this.readOnly = false,
+     this.selected = false,
++    this.imageCountOnPage = 1,
+   }) : super(key: Key('CanvasImage$filePath/${image.id}'));
+ 
+   /// The path to the note that this image is in.
+@@ -34,6 +35,10 @@ class CanvasImage extends StatefulHookWidget {
+   final bool readOnly;
+   final bool selected;
+ 
++  /// 个人自用版：这一页上一共有几张图片。
++  /// 只有一张时"置顶/置底"没有意义，所以用它来决定要不要显示这两个按钮。
++  final int imageCountOnPage;
++
+   /// When notified, all [CanvasImages] will have their [active] property set to false.
+   static var activeListener = ChangeNotifier();
+ 
+@@ -204,6 +209,17 @@ class _CanvasImageState extends State<CanvasImage> {
+     image.onCropImage?.call(image, previous, full);
+   }
+ 
++  /// 个人自用版：切换"强制反色"。
++  ///
++  /// 与长按菜单里那个"反色"不是一回事：那个是"深色模式下不要自动反色"的
++  /// 退出开关，浅色模式下点了看不出变化；这个是**永远反色**，浅色模式下也生效。
++  void toggleForceInvert() {
++    setState(() {
++      widget.image.forceInvert = !widget.image.forceInvert;
++    });
++    widget.image.onMiscChange?.call();
++  }
++
+   Rect panStartRect = .zero;
+   Offset panStartPosition = .zero;
+ 
+@@ -250,7 +266,8 @@ class _CanvasImageState extends State<CanvasImage> {
+       context: context,
+       overrideBoxFit: widget.overrideBoxFit,
+       isBackground: widget.isBackground,
+-      invert: imageBrightness == .dark,
++      // 个人自用版：forceInvert 是"永远反色"，与主题无关
++      invert: imageBrightness == .dark || widget.image.forceInvert,
+     );
+ 
+     // 个人自用版：只有"确实裁剪了"才走裁剪渲染。
+@@ -449,6 +466,8 @@ class _CanvasImageState extends State<CanvasImage> {
+                   cropping: _cropping,
+                   canCrop: canCrop,
+                   canResetCrop: imageIsCropped,
++                  imageInverted: widget.image.forceInvert,
++                  canReorder: widget.imageCountOnPage > 1,
+                   onCrop: enterCropMode,
+                   onFinishCrop: () {
+                     _exitCropMode();
+@@ -458,6 +477,19 @@ class _CanvasImageState extends State<CanvasImage> {
+                     setState(() => _exitCropMode(apply: false));
+                   },
+                   onResetCrop: resetCrop,
++                  onToggleInvert: toggleForceInvert,
++                  onDuplicate: () => widget.image.onImageAction?.call(
++                    widget.image,
++                    .duplicate,
++                  ),
++                  onBringToFront: () => widget.image.onImageAction?.call(
++                    widget.image,
++                    .bringToFront,
++                  ),
++                  onSendToBack: () => widget.image.onImageAction?.call(
++                    widget.image,
++                    .sendToBack,
++                  ),
+                   onDelete: () {
+                     active = false;
+                     widget.image.onDeleteImage?.call(widget.image);
+@@ -694,20 +726,32 @@ class _CanvasImageActionBar extends StatelessWidget {
+     required this.cropping,
+     required this.canCrop,
+     required this.canResetCrop,
++    required this.imageInverted,
++    required this.canReorder,
+     required this.onCrop,
+     required this.onFinishCrop,
+     required this.onCancelCrop,
+     required this.onResetCrop,
++    required this.onToggleInvert,
++    required this.onDuplicate,
++    required this.onBringToFront,
++    required this.onSendToBack,
+     required this.onDelete,
+   });
+ 
+   final bool cropping;
+   final bool canCrop;
+   final bool canResetCrop;
++  final bool imageInverted;
++  final bool canReorder;
+   final VoidCallback onCrop;
+   final VoidCallback onFinishCrop;
+   final VoidCallback onCancelCrop;
+   final VoidCallback onResetCrop;
++  final VoidCallback onToggleInvert;
++  final VoidCallback onDuplicate;
++  final VoidCallback onBringToFront;
++  final VoidCallback onSendToBack;
+   final VoidCallback onDelete;
+ 
+   @override
+@@ -750,6 +794,34 @@ class _CanvasImageActionBar extends StatelessWidget {
+                   tooltip: '重置裁剪',
+                   onTap: onResetCrop,
+                 ),
++              _button(
++                icon: imageInverted
++                    ? Icons.invert_colors
++                    : Icons.invert_colors_off,
++                // 个人自用版：未走 i18n
++                tooltip: imageInverted ? '取消反色' : '反色',
++                onTap: onToggleInvert,
++              ),
++              if (canReorder) ...[
++                _button(
++                  icon: Icons.flip_to_front,
++                  // 个人自用版：未走 i18n
++                  tooltip: '置顶',
++                  onTap: onBringToFront,
++                ),
++                _button(
++                  icon: Icons.flip_to_back,
++                  // 个人自用版：未走 i18n
++                  tooltip: '置底',
++                  onTap: onSendToBack,
++                ),
++              ],
++              _button(
++                icon: Icons.content_copy,
++                // 个人自用版：未走 i18n
++                tooltip: '复制一份',
++                onTap: onDuplicate,
++              ),
+               _button(
+                 icon: Icons.delete_outline,
+                 // 个人自用版：未走 i18n
+diff --git a/lib/components/canvas/image/editor_image.dart b/lib/components/canvas/image/editor_image.dart
+index 62f3bdb8..0a1c5b92 100644
+--- a/lib/components/canvas/image/editor_image.dart
++++ b/lib/components/canvas/image/editor_image.dart
+@@ -23,6 +23,12 @@ part 'png_editor_image.dart';
+ part 'pdf_editor_image.dart';
+ part 'svg_editor_image.dart';
+ 
++/// 个人自用版：动作条上那些"不需要额外参数"的图片操作。
++///
++/// [duplicate] / [bringToFront] / [sendToBack] 都由 editor 实现，
++/// 通过 [EditorImage.onImageAction] 回调过去。
++enum EditorImageAction { duplicate, bringToFront, sendToBack }
++
+ /// The data for an image in the editor.
+ /// This is listenable for changes to the image's position ([dstRect]).
+ sealed class EditorImage extends ChangeNotifier {
+@@ -56,6 +62,11 @@ sealed class EditorImage extends ChangeNotifier {
+   /// 由 editor 在装配图片时赋值即可。
+   void Function(EditorImage image, Rect previous, Rect current)? onCropImage;
+ 
++  /// 个人自用版：动作条上的复制 / 置顶 / 置底，由 editor 处理。
++  ///
++  /// 与 [onCropImage] 一样是可选的字段，不必改三个子类的签名。
++  void Function(EditorImage image, EditorImageAction action)? onImageAction;
++
+   final VoidCallback? onLoad;
+ 
+   /// 个人自用版：srcRect（裁剪框）变更后通知界面重绘。
+@@ -104,6 +115,13 @@ sealed class EditorImage extends ChangeNotifier {
+   /// Whether this image is inverted if Prefs.editorAutoInvert.value
+   bool invertible;
+ 
++  /// 个人自用版：不管主题明暗，**强制**把这张图反色。
++  ///
++  /// 与 [invertible] 正交：那个是"深色模式下**不要**自动反色"的退出开关，
++  /// 只在深色模式下才看得出效果；这个是"永远反色"，浅色模式下也生效
++  /// （例如把深色截图转成适合打印的浅色）。
++  bool forceInvert;
++
+   /// The BoxFit used if this is a page's background image
+   BoxFit backgroundFit;
+ 
+@@ -116,6 +134,7 @@ sealed class EditorImage extends ChangeNotifier {
+     required this.pageSize,
+     this.naturalSize = .zero,
+     this.invertible = true,
++    this.forceInvert = false,
+     this.backgroundFit = .contain,
+     required this.onMoveImage,
+     required this.onDeleteImage,
+@@ -169,6 +188,7 @@ sealed class EditorImage extends ChangeNotifier {
+     'e': extension,
+     'i': pageIndex,
+     'v': invertible,
++    if (forceInvert) 'fi': true,
+     'f': backgroundFit.index,
+     'x': dstRect.left,
+     'y': dstRect.top,
+diff --git a/lib/components/canvas/image/pdf_editor_image.dart b/lib/components/canvas/image/pdf_editor_image.dart
+index 4aa7d83c..080272a8 100644
+--- a/lib/components/canvas/image/pdf_editor_image.dart
++++ b/lib/components/canvas/image/pdf_editor_image.dart
+@@ -24,6 +24,7 @@ class PdfEditorImage extends EditorImage {
+     required super.pageIndex,
+     required super.pageSize,
+     super.invertible,
++    super.forceInvert,
+     super.backgroundFit,
+     required super.onMoveImage,
+     required super.onDeleteImage,
+@@ -83,6 +84,7 @@ class PdfEditorImage extends EditorImage {
+       pageIndex: json['i'] ?? 0,
+       pageSize: .infinite,
+       invertible: json['v'] ?? true,
++      forceInvert: json['fi'] ?? false,
+       backgroundFit: json['f'] != null ? .values[json['f']] : .contain,
+       onMoveImage: null,
+       onDeleteImage: null,
+@@ -194,6 +196,7 @@ class PdfEditorImage extends EditorImage {
+     pageIndex: pageIndex,
+     pageSize: .infinite,
+     invertible: invertible,
++    forceInvert: forceInvert,
+     backgroundFit: backgroundFit,
+     onMoveImage: onMoveImage,
+     onDeleteImage: onDeleteImage,
+@@ -203,7 +206,8 @@ class PdfEditorImage extends EditorImage {
+     dstRect: dstRect,
+     naturalSize: naturalSize,
+     isThumbnail: isThumbnail,
+-  )..onCropImage = onCropImage;
++  )..onCropImage = onCropImage
++      ..onImageAction = onImageAction;
+ 
+   @override
+   void dispose() {
+diff --git a/lib/components/canvas/image/png_editor_image.dart b/lib/components/canvas/image/png_editor_image.dart
+index 4580d77f..708e6f94 100644
+--- a/lib/components/canvas/image/png_editor_image.dart
++++ b/lib/components/canvas/image/png_editor_image.dart
+@@ -34,6 +34,7 @@ class PngEditorImage extends EditorImage {
+     required super.pageSize,
+     this.maxSize,
+     super.invertible,
++    super.forceInvert,
+     super.backgroundFit,
+     required super.onMoveImage,
+     required super.onDeleteImage,
+@@ -90,6 +91,7 @@ class PngEditorImage extends EditorImage {
+       pageIndex: json['i'] ?? 0,
+       pageSize: .infinite,
+       invertible: json['v'] ?? true,
++      forceInvert: json['fi'] ?? false,
+       backgroundFit: json['f'] != null ? .values[json['f']] : .contain,
+       onMoveImage: null,
+       onDeleteImage: null,
+@@ -226,6 +228,7 @@ class PngEditorImage extends EditorImage {
+     pageIndex: pageIndex,
+     pageSize: .infinite,
+     invertible: invertible,
++    forceInvert: forceInvert,
+     backgroundFit: backgroundFit,
+     onMoveImage: onMoveImage,
+     onDeleteImage: onDeleteImage,
+@@ -237,5 +240,6 @@ class PngEditorImage extends EditorImage {
+     naturalSize: naturalSize,
+     thumbnailBytes: thumbnailBytes,
+     isThumbnail: isThumbnail,
+-  )..onCropImage = onCropImage;
++  )..onCropImage = onCropImage
++      ..onImageAction = onImageAction;
+ }
+diff --git a/lib/components/canvas/image/svg_editor_image.dart b/lib/components/canvas/image/svg_editor_image.dart
+index 36f87eec..5164af82 100644
+--- a/lib/components/canvas/image/svg_editor_image.dart
++++ b/lib/components/canvas/image/svg_editor_image.dart
+@@ -17,6 +17,7 @@ class SvgEditorImage extends EditorImage {
+     required super.pageIndex,
+     required super.pageSize,
+     super.invertible,
++    super.forceInvert,
+     super.backgroundFit,
+     required super.onMoveImage,
+     required super.onDeleteImage,
+@@ -78,6 +79,7 @@ class SvgEditorImage extends EditorImage {
+       pageIndex: json['i'] ?? 0,
+       pageSize: .infinite,
+       invertible: json['v'] ?? true,
++      forceInvert: json['fi'] ?? false,
+       backgroundFit: json['f'] != null ? .values[json['f']] : .contain,
+       onMoveImage: null,
+       onDeleteImage: null,
+@@ -198,6 +200,7 @@ class SvgEditorImage extends EditorImage {
+       pageIndex: pageIndex,
+       pageSize: .infinite,
+       invertible: invertible,
++      forceInvert: forceInvert,
+       backgroundFit: backgroundFit,
+       onMoveImage: onMoveImage,
+       onDeleteImage: onDeleteImage,
+@@ -208,6 +211,7 @@ class SvgEditorImage extends EditorImage {
+       srcRect: srcRect,
+       naturalSize: naturalSize,
+       isThumbnail: isThumbnail,
+-    )..onCropImage = onCropImage;
++    )..onCropImage = onCropImage
++      ..onImageAction = onImageAction;
+   }
+ }
+diff --git a/lib/components/canvas/inner_canvas.dart b/lib/components/canvas/inner_canvas.dart
+index 1db7438c..f44c4c28 100644
+--- a/lib/components/canvas/inner_canvas.dart
++++ b/lib/components/canvas/inner_canvas.dart
+@@ -187,6 +187,8 @@ class _InnerCanvasState extends State<InnerCanvas> {
+                     image: page.images[i],
+                     pageSize: Size(widget.width, widget.height),
+                     setAsBackground: widget.setAsBackground,
++                    // 个人自用版：多于一张图时才显示"置顶/置底"
++                    imageCountOnPage: page.images.length,
+                     readOnly:
+                         widget.coreInfo.readOnly || !widget.currentToolIsSelect,
+                     selected:
+diff --git a/lib/data/editor/editor_history.dart b/lib/data/editor/editor_history.dart
+index 71ec7e6e..1e10658f 100644
+--- a/lib/data/editor/editor_history.dart
++++ b/lib/data/editor/editor_history.dart
+@@ -150,6 +150,7 @@ class EditorHistoryItem {
+     this.colorChange,
+     this.backgroundPatternChange,
+     this.srcRectChange,
++    this.imageOrderChange,
+   }) : assert(
+          type != .move || offset != null,
+          'Offset must be provided for move',
+@@ -181,6 +182,10 @@ class EditorHistoryItem {
+        assert(
+          type != .changeSrcRect || srcRectChange != null,
+          'srcRectChange must be provided for changeSrcRect',
++       ),
++       assert(
++         type != .reorderImage || imageOrderChange != null,
++         'imageOrderChange must be provided for reorderImage',
+        );
+ 
+   final EditorHistoryItemType type;
+@@ -196,6 +201,11 @@ class EditorHistoryItem {
+   /// 个人自用版：图片裁剪（`EditorImage.srcRect` 变化）的前后值。
+   final Map<EditorImage, Change<Rect>>? srcRectChange;
+ 
++  /// 个人自用版：图片叠放层级的变化（在 `page.images` 里的下标）。
++  ///
++  /// 渲染顺序就是列表顺序，所以"置顶/置底"就是改下标。
++  final Change<int>? imageOrderChange;
++
+   EditorHistoryItem copyWith({
+     EditorHistoryItemType? type,
+     int? pageIndex,
+@@ -207,6 +217,7 @@ class EditorHistoryItem {
+     Map<Stroke, Change<Color>>? colorChange,
+     Change<CanvasBackgroundPattern>? backgroundPatternChange,
+     Map<EditorImage, Change<Rect>>? srcRectChange,
++    Change<int>? imageOrderChange,
+   }) {
+     return EditorHistoryItem(
+       type: type ?? this.type,
+@@ -220,6 +231,7 @@ class EditorHistoryItem {
+       backgroundPatternChange:
+           backgroundPatternChange ?? this.backgroundPatternChange,
+       srcRectChange: srcRectChange ?? this.srcRectChange,
++      imageOrderChange: imageOrderChange ?? this.imageOrderChange,
+     );
+   }
+ }
+@@ -237,4 +249,7 @@ enum EditorHistoryItemType {
+ 
+   /// 个人自用版：图片裁剪
+   changeSrcRect,
++
++  /// 个人自用版：图片置顶/置底
++  reorderImage,
+ }
+diff --git a/lib/pages/editor/editor.dart b/lib/pages/editor/editor.dart
+index 5f7132c6..93ea0906 100644
+--- a/lib/pages/editor/editor.dart
++++ b/lib/pages/editor/editor.dart
+@@ -232,6 +232,7 @@ class EditorState extends State<Editor> {
+           image.onDeleteImage = onDeleteImage;
+           image.onMiscChange = autosaveAfterDelay;
+           image.onCropImage = onCropImage;
++          image.onImageAction = onImageAction;
+         }
+       }
+     }
+@@ -444,6 +445,16 @@ class EditorState extends State<Editor> {
+             entry.key.srcRect = entry.value.previous;
+             entry.key.notifySrcRectChanged();
+           }
++
++        case .reorderImage:
++          // 个人自用版：撤销置顶/置底
++          for (final image in item.images) {
++            _moveImageToIndex(
++              coreInfo.pages[image.pageIndex].images,
++              image,
++              item.imageOrderChange!.previous,
++            );
++          }
+       }
+ 
+       if (item.type != .move) {
+@@ -505,6 +516,13 @@ class EditorState extends State<Editor> {
+             ),
+           ),
+         );
++      case .reorderImage:
++        // 个人自用版：重做置顶/置底
++        undo(
++          item.copyWith(
++            imageOrderChange: item.imageOrderChange!.reverse(),
++          ),
++        );
+     }
+   }
+ 
+@@ -830,6 +848,75 @@ class EditorState extends State<Editor> {
+     autosaveAfterDelay();
+   }
+ 
++  /// 个人自用版：复制一张图片，稍微错开一点叠在原图上。
++  void duplicateImage(EditorImage image) {
++    final copy = image.copy()
++      // id 必须全笔记唯一：CanvasImage 的 key 用到了 id，
++      // 同一页里出现两个相同 id 会撞 key
++      ..id = coreInfo.nextImageId++
++      ..pageIndex = image.pageIndex
++      ..dstRect = image.dstRect.translate(20, 20)
++      ..newImage = true;
++
++    history.recordChange(
++      EditorHistoryItem(
++        type: .draw,
++        pageIndex: image.pageIndex,
++        strokes: [],
++        images: [copy],
++      ),
++    );
++    setState(() {
++      coreInfo.pages[image.pageIndex].images.add(copy);
++    });
++    autosaveAfterDelay();
++  }
++
++  /// 个人自用版：把图片移到最上层（[toFront]）或最下层。
++  ///
++  /// 图片的渲染顺序就是 `page.images` 的顺序，所以改层级就是改下标。
++  void reorderImage(EditorImage image, {required bool toFront}) {
++    final images = coreInfo.pages[image.pageIndex].images;
++    final previous = images.indexOf(image);
++    if (previous < 0) return;
++
++    final target = toFront ? images.length - 1 : 0;
++    if (previous == target) return;
++
++    setState(() => _moveImageToIndex(images, image, target));
++    history.recordChange(
++      EditorHistoryItem(
++        type: .reorderImage,
++        pageIndex: image.pageIndex,
++        strokes: [],
++        images: [image],
++        imageOrderChange: Change(previous: previous, current: target),
++      ),
++    );
++    autosaveAfterDelay();
++  }
++
++  /// 个人自用版：动作条上的复制 / 置顶 / 置底。
++  void onImageAction(EditorImage image, EditorImageAction action) {
++    switch (action) {
++      case .duplicate:
++        duplicateImage(image);
++      case .bringToFront:
++        reorderImage(image, toFront: true);
++      case .sendToBack:
++        reorderImage(image, toFront: false);
++    }
++  }
++
++  static void _moveImageToIndex(
++    List<EditorImage> images,
++    EditorImage image,
++    int index,
++  ) {
++    images.remove(image);
++    images.insert(index.clamp(0, images.length), image);
++  }
++
+   void listenToQuillChanges(QuillStruct quill, int pageIndex) {
+     quill.changeSubscription?.cancel();
+     quill.changeSubscription = quill.controller.changes.listen((event) {
+@@ -1138,6 +1225,7 @@ class EditorState extends State<Editor> {
+     // onCropImage 不是构造参数（见 EditorImage 里的说明），所以手动装上。
+     for (final image in images) {
+       image.onCropImage = onCropImage;
++      image.onImageAction = onImageAction;
+     }
+ 
+     history.recordChange(
+diff --git a/test/image_force_invert_test.dart b/test/image_force_invert_test.dart
+new file mode 100644
+index 00000000..52264016
+--- /dev/null
++++ b/test/image_force_invert_test.dart
+@@ -0,0 +1,62 @@
++import 'dart:typed_data';
++
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:saber/components/canvas/_asset_cache.dart';
++import 'package:saber/components/canvas/image/editor_image.dart';
++
++/// 个人自用版：验证"反色"（`forceInvert`）会被存进笔记、也能读回来。
++///
++/// 这个字段决定图片是否**永远**反色（与主题明暗无关）。它是新加的序列化字段，
++/// 最容易出的问题不是"开关不生效"而是"存了没读回来 / 读回来丢了"，
++/// 所以这里直接做一次 toJson → fromJson 的往返。
++void main() {
++  final bytes = Uint8List.fromList([1, 2, 3, 4]);
++
++  PngEditorImage image({required bool forceInvert}) => PngEditorImage(
++    id: 1,
++    assetCache: AssetCache(),
++    extension: '.png',
++    imageProvider: MemoryImage(bytes),
++    pageIndex: 0,
++    pageSize: .infinite,
++    onMoveImage: null,
++    onDeleteImage: null,
++    onMiscChange: null,
++    forceInvert: forceInvert,
++  );
++
++  EditorImage reload(Map<String, dynamic> json) => EditorImage.fromJson(
++    json,
++    inlineAssets: [bytes],
++    sbnPath: '/Notes/Test',
++    assetCache: AssetCache(),
++  );
++
++  test('forceInvert is written only when set', () {
++    expect(image(forceInvert: true).toJson(OrderedAssetCache())['fi'], isTrue);
++    expect(
++      image(forceInvert: false).toJson(OrderedAssetCache()).containsKey('fi'),
++      isFalse,
++      reason: 'false 时不该写入，免得把每个老笔记都改一遍',
++    );
++  });
++
++  test('forceInvert survives a save/load round trip', () {
++    final json = image(forceInvert: true).toJson(OrderedAssetCache());
++    expect(reload(json).forceInvert, isTrue);
++  });
++
++  test('an image without the field loads as not inverted', () {
++    final json = image(forceInvert: false).toJson(OrderedAssetCache());
++    expect(reload(json).forceInvert, isFalse);
++  });
++
++  test('forceInvert is independent of invertible', () {
++    // invertible 是"深色模式下不要自动反色"的退出开关，两者互不影响
++    final json = image(forceInvert: true).toJson(OrderedAssetCache());
++    final reloaded = reload(json);
++    expect(reloaded.forceInvert, isTrue);
++    expect(reloaded.invertible, isTrue);
++  });
++}

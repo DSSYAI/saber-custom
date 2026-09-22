@@ -1,0 +1,769 @@
+From 964078f1c9cae3a00d19e803f1e8e1cbac52861d Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sat, 19 Sep 2026 14:23:51 +0800
+Subject: [PATCH 06/14] =?UTF-8?q?feat:=20=E5=AF=BC=E5=85=A5=E5=9B=BE?=
+ =?UTF-8?q?=E7=89=87=E8=B5=B0=E7=B3=BB=E7=BB=9F=E7=9B=B8=E5=86=8C=EF=BC=88?=
+ =?UTF-8?q?=E5=A4=9A=E9=80=89=EF=BC=89=EF=BC=9B=E6=94=AF=E6=8C=81=E3=80=8C?=
+ =?UTF-8?q?=E7=94=A8=20Saber=20=E6=89=93=E5=BC=80=E3=80=8D=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+一、导入图片改走系统相册
+原来用 FilePicker.pickFiles(type: FileType.custom, allowedExtensions: [...])，
+安卓上走 SAF 文档选择器，界面是难以辨认的平板路径。现在安卓/iOS 改走
+image_picker 的 pickMultiImage()，并开启
+ImagePickerAndroid.useAndroidPhotoPicker = true：
+- 安卓 13+ 直接弹系统 Photo Picker（真正的相册 UI，可多选，无需权限）
+- 系统不支持时插件自动回退到相册式 ACTION_GET_CONTENT（同样多选）
+- 桌面平台仍用文件选择器（桌面没有相册概念）
+
+新增 lib/data/tools/image_format_sniffer.dart：以文件头魔数判定真实格式
+（PNG/JPEG/GIF/WebP/BMP/TIFF/ICO/PSD/EXR/SVG）。原因：相册返回的是系统临时
+副本、文件名不可靠，而该扩展名会被 PngEditorImage 写进 .sbn2 笔记数据，
+判错会让笔记里的图片坏掉。不支持的格式（如 HEIC）会提示并跳过，不写坏数据。
+
+相册之外仍保留文件选择器入口：编辑器底部面板「导入」区新增「从文件选择」按钮，
+用于 SVG/PSD/EXR/TGA 等相册不提供的格式。
+
+另注：原代码的 pickFiles 默认 allowMultiple = true，即本来就支持多选，
+此前"只能导入一张"的判断有误；本次未再显式传该已废弃参数。
+
+二、修复「用 Saber 打开」报 GoException: no routes for location: content://...
+根因有两层：
+1. Flutter 的 Android 嵌入层默认开启自动深链（shouldHandleDeeplinking →
+   deepLinkEnabled 在 meta-data 缺失时返回 true），于是 ACTION_VIEW 的 data URI
+   被送进引擎导航通道再交给 GoRouter，没有匹配路由即抛 GoException。
+2. flutter_sharing_intent 把 ACTION_VIEW 当作"打开 URL"（MediaType.URL），
+   而 App.openFile 只接受 SharedMediaType.FILE，直接忽略；且 Dart 无法读取
+   content:// URI。
+
+修法：
+- MainActivity 覆盖 shouldHandleDeeplinking() 返回 false，从源头阻止 URI 进路由；
+  清单中另加 flutter_deeplinking_enabled=false 作为冗余保险
+- MainActivity 新增 MethodChannel saber/incoming_file：用 ContentResolver 把
+  ACTION_VIEW 指向的 content:// 复制到 cacheDir/incoming/<原始文件名>
+  （后台线程复制以免大文件阻塞启动），再把真实路径交给 Dart；
+  file:// 直接取路径不复制；异常吞掉并记日志，不会因复制失败而崩溃
+- lib/main.dart 抽出 openFilePath()，ACTION_SEND 与 ACTION_VIEW 共用导入逻辑；
+  新增 setupIncomingFiles() 覆盖冷启动（启动后轮询几次）与热启动（通道推送）
+- 无需新增权限：ACTION_VIEW 自带 FLAG_GRANT_READ_URI_PERMISSION
+
+依赖：新增 image_picker / image_picker_android / image_picker_platform_interface
+（后两者是为了访问 ImagePickerPlatform.instance 与 useAndroidPhotoPicker）。
+
+验证：flutter analyze 无问题；flutter test 230 通过 / 12 跳过 / 3 失败，
+与改动前完全一致（3 个失败均为既有的 Windows 平台/字体环境问题）；
+新 APK 合并清单含 flutter_deeplinking_enabled=false，dex 含新原生代码，
+lib/ 仍只含 arm64-v8a，apksigner 通过。真机行为待用户实测。
+---
+ android/app/src/main/AndroidManifest.xml      |   9 +
+ .../com/adilhanney/saber/MainActivity.kt      | 172 +++++++++++++++++-
+ .../toolbar/editor_bottom_sheet.dart          |  15 ++
+ lib/data/tools/image_format_sniffer.dart      |  66 +++++++
+ lib/main.dart                                 |  64 ++++++-
+ lib/pages/editor/editor.dart                  |  86 ++++++++-
+ macos/Flutter/GeneratedPluginRegistrant.swift |   2 +
+ pubspec.lock                                  |  80 ++++++++
+ pubspec.yaml                                  |   7 +
+ 9 files changed, 491 insertions(+), 10 deletions(-)
+ create mode 100644 lib/data/tools/image_format_sniffer.dart
+
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 368808f6..7e9a6092 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -45,6 +45,15 @@
+               android:name="io.flutter.embedding.android.NormalTheme"
+               android:resource="@style/NormalTheme"
+               />
++            <!-- 个人自用版：关闭 Flutter 的自动深链。
++                 否则「用 Saber 打开」时 intent 的 data URI（content://...）会被
++                 当成 Flutter 初始路由交给 GoRouter，抛
++                 "GoException: no routes for location: content://..."。
++                 MainActivity 里也覆盖了 shouldHandleDeeplinking()，这里作为冗余保险。 -->
++            <meta-data
++              android:name="flutter_deeplinking_enabled"
++              android:value="false"
++              />
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN"/>
+                 <category android:name="android.intent.category.LAUNCHER"/>
+diff --git a/android/app/src/main/kotlin/com/adilhanney/saber/MainActivity.kt b/android/app/src/main/kotlin/com/adilhanney/saber/MainActivity.kt
+index 9397cab4..5c9a5ee3 100644
+--- a/android/app/src/main/kotlin/com/adilhanney/saber/MainActivity.kt
++++ b/android/app/src/main/kotlin/com/adilhanney/saber/MainActivity.kt
+@@ -1,18 +1,59 @@
+ package com.adilhanney.saber
+ 
++import android.content.Intent
++import android.content.Intent.FLAG_ACTIVITY_NEW_TASK
++import android.net.Uri
+ import android.os.Bundle
+-import androidx.core.view.ViewCompat
++import android.provider.OpenableColumns
++import android.util.Log
++import android.webkit.MimeTypeMap
+ import androidx.core.view.WindowCompat
+ import io.flutter.embedding.android.FlutterActivity
+-import android.content.Intent.FLAG_ACTIVITY_NEW_TASK
++import io.flutter.embedding.engine.FlutterEngine
++import io.flutter.plugin.common.MethodChannel
++import java.io.File
++
++class MainActivity : FlutterActivity() {
++    companion object {
++        private const val TAG = "SaberIncomingFile"
++        private const val CHANNEL = "saber/incoming_file"
++        private const val METHOD_GET_INITIAL = "getInitialFile"
++        private const val METHOD_NEW = "newFile"
++    }
++
++    /**
++     * 已复制完成、等待 Dart 取走的文件绝对路径。
++     * Dart 读不了 content:// URI，所以由原生侧落盘后把真实路径交出去。
++     */
++    @Volatile
++    private var pendingPath: String? = null
++
++    private var channel: MethodChannel? = null
++
++    /**
++     * 个人自用版：关闭 Flutter 的自动深链处理。
++     *
++     * 保持开启时（默认值，见 FlutterActivityLaunchConfigs.deepLinkEnabled），
++     * 用 ACTION_VIEW 拉起本应用会把 intent 的 data URI —— 也就是
++     * content://com.tencent.mm.external.fileprovider/attachment/xxx.pdf ——
++     * 直接当成 Flutter 的初始路由送进引擎，再交给 GoRouter，于是抛
++     * "GoException: no routes for location: content://..."。
++     *
++     * 本应用的路由完全由 GoRouter 自己管理（initialLocation 是固定值），
++     * 不需要 intent URI 参与路由，因此直接关掉，改由下面的通道处理文件。
++     */
++    override fun shouldHandleDeeplinking(): Boolean = false
+ 
+-class MainActivity: FlutterActivity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         if (intent.getIntExtra("org.chromium.chrome.extra.TASK_ID", -1) == this.taskId) {
+             this.finish()
+-            intent.addFlags(FLAG_ACTIVITY_NEW_TASK);
+-            startActivity(intent);
++            intent.addFlags(FLAG_ACTIVITY_NEW_TASK)
++            startActivity(intent)
+         }
++
++        // 必须在 super.onCreate 之前发起：越早拿到 intent 的读权限越稳
++        handleIncomingIntent(intent)
++
+         super.onCreate(savedInstanceState)
+ 
+         WindowCompat.setDecorFitsSystemWindows(window, false)
+@@ -20,4 +61,123 @@ class MainActivity: FlutterActivity() {
+         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+         windowInsetsController.isAppearanceLightNavigationBars = true
+     }
+-}
++
++    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
++        super.configureFlutterEngine(flutterEngine)
++
++        val methodChannel =
++            MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
++        methodChannel.setMethodCallHandler { call, result ->
++            when (call.method) {
++                METHOD_GET_INITIAL -> {
++                    result.success(pendingPath)
++                    pendingPath = null
++                }
++                else -> result.notImplemented()
++            }
++        }
++        channel = methodChannel
++    }
++
++    override fun onNewIntent(intent: Intent) {
++        super.onNewIntent(intent)
++        setIntent(intent)
++        // 应用已经开着时，再从微信/文件管理器打开另一个文件
++        handleIncomingIntent(intent)
++    }
++
++    /**
++     * 处理「用 Saber 打开」（ACTION_VIEW）。
++     *
++     * ACTION_VIEW 携带 FLAG_GRANT_READ_URI_PERMISSION，所以
++     * contentResolver.openInputStream 可以直接读取，无需申请任何存储权限。
++     */
++    private fun handleIncomingIntent(intent: Intent?) {
++        if (intent == null) return
++        if (intent.action != Intent.ACTION_VIEW) return
++        val uri: Uri = intent.data ?: return
++
++        if (uri.scheme == "file") {
++            deliver(uri.path)
++            return
++        }
++        if (uri.scheme != "content" && uri.scheme != "android.resource") {
++            Log.w(TAG, "Ignoring unsupported uri scheme: ${uri.scheme}")
++            return
++        }
++
++        // 后台线程复制，避免大 PDF 阻塞启动导致 ANR
++        Thread {
++            try {
++                deliver(copyToCache(uri))
++            } catch (e: Exception) {
++                Log.e(TAG, "Failed to copy incoming file: $uri", e)
++            }
++        }.start()
++    }
++
++    private fun deliver(path: String?) {
++        if (path == null) return
++        // 先存入待取槽，再尝试推送：推送万一落在 Dart 尚未注册 handler 的窗口里，
++        // Dart 启动后调用 getInitialFile 仍能取到。
++        pendingPath = path
++
++        val methodChannel = channel
++        if (methodChannel == null) {
++            Log.i(TAG, "Dart not ready yet, keeping $path pending")
++            return
++        }
++        runOnUiThread { methodChannel.invokeMethod(METHOD_NEW, path) }
++    }
++
++    private fun copyToCache(uri: Uri): String? {
++        val displayName = queryDisplayName(uri) ?: "incoming_${System.currentTimeMillis()}"
++        val dir = File(cacheDir, "incoming").apply { mkdirs() }
++
++        val safeName = displayName.replace(Regex("[/\\\\]"), "_")
++        var target = File(dir, safeName)
++        if (target.exists()) {
++            // 同一个文件反复打开时不要互相覆盖
++            target = File(dir, "${System.currentTimeMillis()}_$safeName")
++        }
++
++        contentResolver.openInputStream(uri).use { input ->
++            if (input == null) {
++                Log.e(TAG, "openInputStream returned null for $uri")
++                return null
++            }
++            target.outputStream().use { output -> input.copyTo(output) }
++        }
++        Log.i(TAG, "Copied incoming file to ${target.absolutePath}")
++        return target.absolutePath
++    }
++
++    /** 取原始文件名（例如微信的「生物化学实验CB.pdf」），拿不到就退回 URI 末段。 */
++    private fun queryDisplayName(uri: Uri): String? {
++        try {
++            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
++                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
++                if (index >= 0 && cursor.moveToFirst()) {
++                    val name = cursor.getString(index)
++                    if (!name.isNullOrBlank()) return ensureExtension(name, uri)
++                }
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to query display name for $uri", e)
++        }
++        return uri.lastPathSegment?.let { ensureExtension(it, uri) }
++    }
++
++    /** 有些 provider 的显示名不带扩展名；用 MIME 补一个，否则 Dart 侧判不出文件类型。 */
++    private fun ensureExtension(name: String, uri: Uri): String {
++        if (name.contains('.')) return name
++        val mime = try {
++            contentResolver.getType(uri)
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to get mime type for $uri", e)
++            null
++        }
++        val extension = mime?.let { MimeTypeMap.getSingleton().getExtensionFromMimeType(it) }
++        return if (extension.isNullOrBlank()) name else "$name.$extension"
++    }
++}
+\ No newline at end of file
+diff --git a/lib/components/toolbar/editor_bottom_sheet.dart b/lib/components/toolbar/editor_bottom_sheet.dart
+index c149e671..fd681fdd 100644
+--- a/lib/components/toolbar/editor_bottom_sheet.dart
++++ b/lib/components/toolbar/editor_bottom_sheet.dart
+@@ -27,6 +27,8 @@ class EditorBottomSheet extends StatefulWidget {
+     required this.clearAllPages,
+     required this.redrawAndSave,
+     required this.pickPhotos,
++    // 个人自用版：相册路径之外的"从文件选择"兜底入口（SVG/PSD 等）
++    required this.pickPhotosFromFiles,
+     required this.importPdf,
+     required this.canRasterPdf,
+   });
+@@ -43,6 +45,8 @@ class EditorBottomSheet extends StatefulWidget {
+   final VoidCallback clearAllPages;
+   final VoidCallback redrawAndSave;
+   final Future<int> Function() pickPhotos;
++  // 个人自用版：从文件选择器导入图片（相册不提供的格式）
++  final Future<int> Function() pickPhotosFromFiles;
+   final Future<bool> Function() importPdf;
+   final bool canRasterPdf;
+ 
+@@ -299,6 +303,17 @@ class _EditorBottomSheetState extends State<EditorBottomSheet> {
+                   },
+                   child: Text(t.editor.toolbar.photo),
+                 ),
++                // 个人自用版：相册之外的兜底入口（SVG/PSD/EXR/TGA 等相册不提供的格式）
++                ElevatedButton(
++                  onPressed: () async {
++                    final photosPicked = await widget.pickPhotosFromFiles();
++                    if (photosPicked > 0) {
++                      if (!context.mounted) return;
++                      Navigator.pop(context);
++                    }
++                  },
++                  child: const Text('从文件选择'),
++                ),
+                 if (widget.canRasterPdf)
+                   ElevatedButton(
+                     onPressed: () async {
+diff --git a/lib/data/tools/image_format_sniffer.dart b/lib/data/tools/image_format_sniffer.dart
+new file mode 100644
+index 00000000..7cbe552f
+--- /dev/null
++++ b/lib/data/tools/image_format_sniffer.dart
+@@ -0,0 +1,66 @@
++import 'dart:typed_data';
++
++/// 个人自用版：从文件头（魔数）判定图片的真实格式，返回带点的扩展名。
++///
++/// 为什么需要它：安卓相册（Photo Picker）返回的是系统临时副本，文件名不一定带
++/// 正确扩展名，而从文件选择器导入时扩展名又完全依赖文件名。而这个扩展名会被
++/// `PngEditorImage` **写进 `.sbn2` 笔记数据**，判错会让笔记里的图片坏掉，
++/// 所以以字节内容为准、文件名只作兜底。
++///
++/// 返回 null 表示无法从内容识别（例如 TGA/PVRTC 没有可靠的头部魔数），
++/// 此时调用方应退回按文件名判定。
++String? sniffImageExtension(Uint8List bytes) {
++  if (bytes.length < 4) return null;
++
++  bool startsWith(List<int> magic, [int offset = 0]) {
++    if (bytes.length < offset + magic.length) return false;
++    for (var i = 0; i < magic.length; i++) {
++      if (bytes[offset + i] != magic[i]) return false;
++    }
++    return true;
++  }
++
++  // PNG: 89 50 4E 47 0D 0A 1A 0A
++  if (startsWith(const [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])) {
++    return '.png';
++  }
++  // JPEG: FF D8 FF
++  if (startsWith(const [0xFF, 0xD8, 0xFF])) return '.jpg';
++  // GIF: "GIF8"
++  if (startsWith(const [0x47, 0x49, 0x46, 0x38])) return '.gif';
++  // WebP: "RIFF" .... "WEBP"
++  if (startsWith(const [0x52, 0x49, 0x46, 0x46]) &&
++      startsWith(const [0x57, 0x45, 0x42, 0x50], 8)) {
++    return '.webp';
++  }
++  // BMP: "BM"
++  if (startsWith(const [0x42, 0x4D])) return '.bmp';
++  // TIFF: little endian "II*\0" 或 big endian "MM\0*"
++  if (startsWith(const [0x49, 0x49, 0x2A, 0x00]) ||
++      startsWith(const [0x4D, 0x4D, 0x00, 0x2A])) {
++    return '.tiff';
++  }
++  // ICO / CUR: 00 00 01 00 / 00 00 02 00
++  if (startsWith(const [0x00, 0x00, 0x01, 0x00])) return '.ico';
++  // PSD: "8BPS"
++  if (startsWith(const [0x38, 0x42, 0x50, 0x53])) return '.psd';
++  // OpenEXR: 76 2F 31 01
++  if (startsWith(const [0x76, 0x2F, 0x31, 0x01])) return '.exr';
++  // SVG: 文本格式，先跳过前导空白/BOM/XML 声明再找 "<svg"
++  final svg = _sniffSvg(bytes);
++  if (svg) return '.svg';
++
++  return null;
++}
++
++bool _sniffSvg(Uint8List bytes) {
++  // 只检查开头一小段，避免大文件全量解码
++  final head = bytes.length > 1024 ? bytes.sublist(0, 1024) : bytes;
++  String text;
++  try {
++    text = String.fromCharCodes(head);
++  } catch (_) {
++    return false;
++  }
++  return text.contains('<svg') || text.contains('<?xml');
++}
+diff --git a/lib/main.dart b/lib/main.dart
+index 963f9d56..d947fdb2 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -153,10 +153,27 @@ class const App({super.key}) extends StatefulWidget {
+     ],
+   );
+ 
++  /// 原生侧（MainActivity）把「用 Saber 打开」的文件复制成真实路径后，
++  /// 通过这个通道交给 Dart —— Dart 无法读取 content:// URI。
++  static const _incomingFileChannel = MethodChannel('saber/incoming_file');
++
+   static void openFile(SharedFile file) async {
+     final filePath = file.value;
+     if (file.type != SharedMediaType.FILE || filePath == null) return;
+-    log.info('Opening file: (${file.type}) $filePath');
++
++    // 个人自用版：content:// 之类的 URI 由原生侧负责落盘（见 setupIncomingFiles），
++    // flutter_sharing_intent 只会把它标成 URL，这里直接忽略，不要当成文件路径去读。
++    if (filePath.contains('://') && !filePath.startsWith('file://')) return;
++
++    await openFilePath(filePath);
++  }
++
++  /// 打开一个真实文件路径。
++  ///
++  /// 「分享到 Saber」（ACTION_SEND）与「用 Saber 打开」（ACTION_VIEW，经
++  /// MainActivity 复制到缓存目录后）共用这段逻辑。
++  static Future<void> openFilePath(String filePath) async {
++    log.info('Opening file: $filePath');
+ 
+     var extension = p.extension(filePath);
+     if (extension.isEmpty) {
+@@ -182,7 +199,7 @@ class const App({super.key}) extends StatefulWidget {
+       );
+       _router.push(RoutePaths.editImportPdf(sbnFilePath, filePath));
+     } else {
+-      log.warning('openFile: Unsupported file type: $extension');
++      log.warning('openFilePath: Unsupported file type: $extension');
+     }
+   }
+ 
+@@ -196,9 +213,52 @@ class _AppState extends State<App> {
+   @override
+   void initState() {
+     setupSharingIntent();
++    setupIncomingFiles();
+     super.initState();
+   }
+ 
++  /// 个人自用版：接收「用 Saber 打开」（ACTION_VIEW）的文件。
++  ///
++  /// 原生侧 MainActivity 会把 content:// 复制到缓存目录，再把真实路径通过通道送来；
++  /// 文件复制是在后台线程做的，冷启动时可能还没完成，所以除了通道推送之外，
++  /// 这里还会轮询几次（原生侧会把路径留在待取槽里直到 Dart 取走）。
++  void setupIncomingFiles() {
++    if (!Platform.isAndroid) return;
++
++    App._incomingFileChannel.setMethodCallHandler((call) async {
++      if (call.method == 'newFile' && call.arguments is String) {
++        await App.openFilePath(call.arguments as String);
++      }
++      return null;
++    });
++
++    unawaited(_pollIncomingFiles());
++  }
++
++  Future<void> _pollIncomingFiles() async {
++    for (final delay in const [
++      Duration.zero,
++      Duration(milliseconds: 500),
++      Duration(milliseconds: 1500),
++    ]) {
++      if (delay > Duration.zero) await Future.delayed(delay);
++      try {
++        final path = await App._incomingFileChannel.invokeMethod<String>(
++          'getInitialFile',
++        );
++        if (path != null) {
++          await App.openFilePath(path);
++          return;
++        }
++      } on MissingPluginException {
++        return; // 原生侧没有实现（例如非 Android 构建）
++      } on PlatformException catch (e) {
++        App.log.warning('setupIncomingFiles: ${e.message}');
++        return;
++      }
++    }
++  }
++
+   void setupSharingIntent() {
+     if (Platform.isAndroid || Platform.isIOS) {
+       // for files opened while the app is closed
+diff --git a/lib/pages/editor/editor.dart b/lib/pages/editor/editor.dart
+index db34cc15..e565ec67 100644
+--- a/lib/pages/editor/editor.dart
++++ b/lib/pages/editor/editor.dart
+@@ -10,6 +10,9 @@ import 'package:flutter/gestures.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter/services.dart';
+ import 'package:flutter_quill/flutter_quill.dart' as flutter_quill;
++import 'package:image_picker/image_picker.dart';
++import 'package:image_picker_android/image_picker_android.dart';
++import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
+ import 'package:keybinder/keybinder.dart';
+ import 'package:logging/logging.dart';
+ import 'package:path/path.dart' as p;
+@@ -41,6 +44,7 @@ import 'package:saber/data/prefs.dart';
+ import 'package:saber/data/tools/_tool.dart';
+ import 'package:saber/data/tools/eraser.dart';
+ import 'package:saber/data/tools/highlighter.dart';
++import 'package:saber/data/tools/image_format_sniffer.dart';
+ import 'package:saber/data/tools/laser_pointer.dart';
+ import 'package:saber/data/tools/pen.dart';
+ import 'package:saber/data/tools/pencil.dart';
+@@ -1107,7 +1111,78 @@ class EditorState extends State<Editor> {
+     return images.length;
+   }
+ 
++  /// 支持的图片扩展名（与文件选择器白名单保持一致）。
++  static const _supportedImageExtensions = {
++    '.jpg',
++    '.jpeg',
++    '.png',
++    '.gif',
++    '.tiff',
++    '.bmp',
++    '.tga',
++    '.ico',
++    '.pvrtc',
++    '.svg',
++    '.webp',
++    '.psd',
++    '.exr',
++  };
++
++  /// 个人自用版：安卓/iOS 走系统相册（支持多选），桌面没有"相册"概念，
++  /// 仍走文件选择器。
+   Future<List<_PhotoInfo>> _pickPhotosWithFilePicker() async {
++    if (Platform.isAndroid || Platform.isIOS) {
++      return _pickPhotosFromGallery();
++    }
++    return _pickPhotosFromFiles();
++  }
++
++  /// 从系统相册多选导入图片。
++  ///
++  /// 扩展名以字节内容（魔数）为准、文件名只作兜底：相册返回的是系统临时副本，
++  /// 文件名不一定带正确扩展名，而这个扩展名会被 [PngEditorImage] 写进 `.sbn2`
++  /// 笔记数据，判错会让笔记里的图片坏掉。
++  Future<List<_PhotoInfo>> _pickPhotosFromGallery() async {
++    // 安卓 13+ 启用系统 Photo Picker（真正的相册 UI）。
++    // 系统不支持时会自动回退到相册式的 ACTION_GET_CONTENT（同样支持多选）。
++    final platform = ImagePickerPlatform.instance;
++    if (platform is ImagePickerAndroid) {
++      platform.useAndroidPhotoPicker = true;
++    }
++
++    final files = await ImagePicker().pickMultiImage();
++    if (files.isEmpty) return const [];
++
++    final photoInfos = <_PhotoInfo>[];
++    final skipped = <String>[];
++    for (final file in files) {
++      final bytes = await file.readAsBytes();
++      final extension = (sniffImageExtension(bytes) ?? p.extension(file.name))
++          .toLowerCase();
++      if (!_supportedImageExtensions.contains(extension)) {
++        skipped.add(file.name);
++        continue;
++      }
++      photoInfos.add((bytes: bytes, extension: extension));
++    }
++
++    if (skipped.isNotEmpty && mounted) {
++      // 个人自用版：未走 i18n，文案直接用中文字面量
++      ScaffoldMessenger.of(context).showSnackBar(
++        SnackBar(
++          content: Text(
++            '已跳过 ${skipped.length} 张不支持的图片格式（如 HEIC）：'
++            '${skipped.join('、')}',
++          ),
++        ),
++      );
++    }
++    return photoInfos;
++  }
++
++  /// 从文件选择器导入图片。
++  /// 相册不提供的格式走这里（SVG / PSD / EXR / TGA 等）。
++  Future<List<_PhotoInfo>> _pickPhotosFromFiles() async {
+     final List<PlatformFile> files = await FilePicker.pickFiles(
+       type: FileType.custom,
+       // Taken from
+@@ -1134,14 +1209,20 @@ class EditorState extends State<Editor> {
+     return Future.wait([
+       for (final file in files)
+         () async {
+-          final extension = p.extension(file.path ?? file.name);
+-          if (extension.isEmpty) return null;
+           final bytes = await file.readAsBytes();
++          final extension =
++              (sniffImageExtension(bytes) ?? p.extension(file.path ?? file.name))
++                  .toLowerCase();
++          if (extension.isEmpty) return null;
+           return (bytes: bytes, extension: extension);
+         }(),
+     ]).then((list) => list.nonNulls.toList());
+   }
+ 
++  /// 个人自用版：底部面板里的"从文件选择"入口（相册路径之外的兜底）。
++  Future<int> pickPhotosFromFiles() async =>
++      _pickPhotos(await _pickPhotosFromFiles());
++
+   /// Prompts the user to pick a PDF to import.
+   /// Returns whether a PDF was picked.
+   Future<bool> importPdf() async {
+@@ -1741,6 +1822,7 @@ class EditorState extends State<Editor> {
+         autosaveAfterDelay();
+       }),
+       pickPhotos: _pickPhotos,
++          pickPhotosFromFiles: pickPhotosFromFiles,
+       importPdf: importPdf,
+       canRasterPdf: Editor.canRasterPdf,
+     );
+diff --git a/macos/Flutter/GeneratedPluginRegistrant.swift b/macos/Flutter/GeneratedPluginRegistrant.swift
+index b99ec0c1..e932dbcf 100644
+--- a/macos/Flutter/GeneratedPluginRegistrant.swift
++++ b/macos/Flutter/GeneratedPluginRegistrant.swift
+@@ -8,6 +8,7 @@ import Foundation
+ import device_info_plus
+ import dynamic_color
+ import file_picker_darwin
++import file_selector_macos
+ import flutter_secure_storage_darwin
+ import pdfium_flutter
+ import printing
+@@ -22,6 +23,7 @@ func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
+   DeviceInfoPlusMacosPlugin.register(with: registry.registrar(forPlugin: "DeviceInfoPlusMacosPlugin"))
+   DynamicColorPlugin.register(with: registry.registrar(forPlugin: "DynamicColorPlugin"))
+   FilePickerPlugin.register(with: registry.registrar(forPlugin: "FilePickerPlugin"))
++  FileSelectorPlugin.register(with: registry.registrar(forPlugin: "FileSelectorPlugin"))
+   FlutterSecureStorageDarwinPlugin.register(with: registry.registrar(forPlugin: "FlutterSecureStorageDarwinPlugin"))
+   PDFiumFlutterPlugin.register(with: registry.registrar(forPlugin: "PDFiumFlutterPlugin"))
+   PrintingPlugin.register(with: registry.registrar(forPlugin: "PrintingPlugin"))
+diff --git a/pubspec.lock b/pubspec.lock
+index b80228b3..6938d4e2 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -369,6 +369,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "0.9.4"
++  file_selector_macos:
++    dependency: transitive
++    description:
++      name: file_selector_macos
++      sha256: d57c62362766b5e7ae739448650b66c6aab7a68ba7ecc65e04018652645ae0f4
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.9.5+1"
+   file_selector_platform_interface:
+     dependency: transitive
+     description:
+@@ -488,6 +496,14 @@ packages:
+     description: flutter
+     source: sdk
+     version: "0.0.0"
++  flutter_plugin_android_lifecycle:
++    dependency: transitive
++    description:
++      name: flutter_plugin_android_lifecycle
++      sha256: "3854fe5e3bff0b113c658f260b90c95dea17c92db0f2addeac2e343dd9969785"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.0.35"
+   flutter_quill:
+     dependency: "direct main"
+     description:
+@@ -688,6 +704,70 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "4.9.2"
++  image_picker:
++    dependency: "direct main"
++    description:
++      name: image_picker
++      sha256: d8402284df184bc05f4a2210c6c23983b0720f4cd87cbd05c5390a78af602667
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.2.3"
++  image_picker_android:
++    dependency: "direct main"
++    description:
++      name: image_picker_android
++      sha256: "0a55d645a670d6ae11efa948f955ae904afa472f1344fc15a7ddacc20c1e7219"
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.8.13+23"
++  image_picker_for_web:
++    dependency: transitive
++    description:
++      name: image_picker_for_web
++      sha256: "66257a3191ab360d23a55c8241c91a6e329d31e94efa7be9cf7a212e65850214"
++      url: "https://pub.dev"
++    source: hosted
++    version: "3.1.1"
++  image_picker_ios:
++    dependency: transitive
++    description:
++      name: image_picker_ios
++      sha256: ee3885b6fcd71958fbc79770dd194c63371439d536d69c47b279171a486482ae
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.8.13+7"
++  image_picker_linux:
++    dependency: transitive
++    description:
++      name: image_picker_linux
++      sha256: "1f81c5f2046b9ab724f85523e4af65be1d47b038160a8c8deed909762c308ed4"
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.2.2"
++  image_picker_macos:
++    dependency: transitive
++    description:
++      name: image_picker_macos
++      sha256: "86f0f15a309de7e1a552c12df9ce5b59fe927e71385329355aec4776c6a8ec91"
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.2.2+1"
++  image_picker_platform_interface:
++    dependency: "direct main"
++    description:
++      name: image_picker_platform_interface
++      sha256: "567e056716333a1647c64bb6bd873cff7622233a5c3f694be28a583d4715690c"
++      url: "https://pub.dev"
++    source: hosted
++    version: "2.11.1"
++  image_picker_windows:
++    dependency: transitive
++    description:
++      name: image_picker_windows
++      sha256: d248c86554a72b5495a31c56f060cf73a41c7ff541689327b1a7dbccc33adfae
++      url: "https://pub.dev"
++    source: hosted
++    version: "0.2.2"
+   ini:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 4045eb70..33c090fd 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -146,6 +146,13 @@ dependencies:
+   image: ^4.8.0
+   pool: ^1.5.2
+ 
++  # 个人自用版：导入图片时走系统相册（Photo Picker，支持多选）
++  image_picker: ^1.2.3
++  image_picker_android: ^0.8.13+23
++  # 需要 ImagePickerPlatform.instance 才能开启安卓系统相册选择器
++  # （image_picker 自身只 show 了部分符号，没导出它）
++  image_picker_platform_interface: ^2.11.1
++
+ dev_dependencies:
+   flutter_test:
+     sdk: flutter

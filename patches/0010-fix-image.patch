@@ -1,0 +1,548 @@
+From 62821c938336f081e28ba3eebb1a93bf4596afd6 Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 12:15:01 +0800
+Subject: [PATCH 10/14] =?UTF-8?q?fix(image):=20=E6=8A=8A=E6=89=8B=EF=BC=88?=
+ =?UTF-8?q?=E5=B0=8F=E5=9C=86=E7=82=B9=EF=BC=89=E5=8F=AF=E7=82=B9=E8=8C=83?=
+ =?UTF-8?q?=E5=9B=B4=E5=8F=AA=E6=9C=89=E7=9C=8B=E5=88=B0=E7=9A=84=E4=B8=80?=
+ =?UTF-8?q?=E5=8D=8A=EF=BC=8C=E4=BF=AE=E6=8E=89"=E6=80=BB=E6=98=AF?=
+ =?UTF-8?q?=E7=82=B9=E4=B8=8D=E5=88=B0"?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+现象：裁剪和缩放的小圆点触感很差，总是点不到。
+
+根因（不是手不准，而是**看得见的那半根本不在命中范围内**）：
+把手用 DeferPointer(paintOnTop) 画在最上层，所以整圆都看得见；但它的父级
+Stack 尺寸正好等于图片大小，而把手中心压在图片/裁剪框的边界上，
+伸到外面的那一半就落在父级尺寸之外 —— Flutter 的 RenderBox.hitTest 一旦
+发现点落在自身尺寸之外就直接返回，父级边界外没有命中测试可言。
+角落把手实际可点区域因此只有 20×20（40×40 的四分之一）。
+
+修法：把图片的"格子"向外扩 handlePadding(=28)，这一圈专门用来放把手；
+图片内容用 Positioned(left/top: pad) 补回来 —— 所以**图片的位置与尺寸
+和改动前完全一致**，只是外面多了一圈可命中的余量：
+
+- canvas_image.dart：外层 Stack 从"正好图片大小"改为"图片加 pad"，
+  缩放把手与裁剪层都移进这个放大后的格子；把手直径 40 改成 44
+- image_crop_overlay.dart：新增 padding 参数，这一圈属于它自己的命中范围；
+  把手中心仍在裁剪框边上（视觉不变），但整圆都可点
+- 顺带修正 _CanvasImageResizeHandle 之前用 dstRect 而不是实际格子尺寸
+  max(dstRect, minInteractiveSize) 算把手位置的问题
+
+测试：新增"把手必须完整落在可命中范围内"的断言（padding 场景下逐个检查
+8 个把手的矩形都在本 widget 范围内）。golden 全部通过，证明图片本身的
+渲染位置与尺寸没有变。
+---
+ lib/components/canvas/canvas_image.dart       | 137 ++++++++++++------
+ lib/components/canvas/image_crop_overlay.dart | 128 ++++++++++------
+ test/image_crop_overlay_test.dart             |  72 ++++++++-
+ 3 files changed, 245 insertions(+), 92 deletions(-)
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index b7914aa5..2a172820 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -43,6 +43,14 @@ class CanvasImage extends StatefulHookWidget {
+   /// The minimum size of the image itself, inside of the interactive area.
+   static double minImageSize = 10;
+ 
++  /// 个人自用版：把手（小圆点）的直径。原来 40，稍放大一点更好按。
++  static const handleSize = 44.0;
++
++  /// 个人自用版：图片格子向外扩出的余量，用来容纳跨在边框上的把手。
++  ///
++  /// 必须 >= [handleSize] / 2，否则把手仍有一半落在格子外，那半永远点不到。
++  static const handlePadding = 28.0;
++
+   /// 个人自用版：判断 [srcRect] 是否真的裁掉了东西。
+   ///
+   /// 未裁剪时 `srcRect` 等于 `(0, 0, naturalSize)`，但这个值会经过存盘/读盘的
+@@ -338,35 +346,19 @@ class _CanvasImageState extends State<CanvasImage> {
+                   child: SizedBox(
+                     width: boxWidth,
+                     height: boxHeight,
+-                    child: Stack(
+-                      fit: StackFit.expand,
+-                      children: [
+-                        if (cropped)
+-                          CroppedImage(
++                    child: cropped
++                        ? CroppedImage(
+                             srcRect: widget.image.srcRect,
+                             sourceSize: widget.image.naturalSize,
+                             child: imageWidget,
+                           )
+-                        else
+-                          SizedOverflowBox(
++                        : SizedOverflowBox(
+                             size: widget.image.srcRect.size,
+                             child: Transform.translate(
+                               offset: -widget.image.srcRect.topLeft,
+                               child: imageWidget,
+                             ),
+                           ),
+-
+-                        // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）
+-                        if (_cropping)
+-                          ImageCropOverlay(
+-                            cropRect: _pendingCrop,
+-                            sourceSize: widget.image.naturalSize,
+-                            boxSize: Size(boxWidth, boxHeight),
+-                            onChanged: (cropRect) =>
+-                                setState(() => _pendingCrop = cropRect),
+-                          ),
+-                      ],
+-                    ),
+                   ),
+                 ),
+               ),
+@@ -374,17 +366,6 @@ class _CanvasImageState extends State<CanvasImage> {
+           ),
+           if (widget.selected) // tint image if selected
+             ColoredBox(color: colorScheme.primary.withValues(alpha: 0.5)),
+-          if (!widget.readOnly && !_cropping)
+-            for (double x = -20; x <= 20; x += 20)
+-              for (double y = -20; y <= 20; y += 20)
+-                if (x != 0 || y != 0) // ignore (0,0)
+-                  _CanvasImageResizeHandle(
+-                    active: active,
+-                    position: Offset(x, y),
+-                    image: widget.image,
+-                    parent: this,
+-                    afterDrag: () => setState(() {}),
+-                  ),
+         ],
+       ),
+     );
+@@ -400,18 +381,67 @@ class _CanvasImageState extends State<CanvasImage> {
+         child: unpositioned,
+       );
+     }
+-    // 个人自用版：选中时在图片**下方**浮出动作条。
+-    // 外层必须 Clip.none，否则超出图片框的动作条会被裁掉。
++    // 个人自用版：图片的"格子"比图片本身大一圈，这一圈专门留给把手。
++    //
++    // 为什么需要：把手画在图片/裁剪框的边上（视觉上跨过边框），但只要格子的边界
++    // 正好等于图片边界，伸到外面的那一半就**既看得见又点不到** —— Flutter 的
++    // RenderBox.hitTest 一旦发现点落在自身尺寸之外就直接返回，父级边界之外
++    // 根本没有命中测试可言。这就是"小圆点总是点不到"的根因：
++    // 角落把手实际可点区域只有 20×20。
++    //
++    // 格子放大 pad 之后，图片内容用 Positioned(left/top: pad) 补回来，
++    // 所以图片的位置与尺寸和改动前**完全一致**，只是在外面多了一圈可点的余量。
++    const double pad = CanvasImage.handlePadding;
++
++    final bool showResizeHandles = !widget.readOnly && !_cropping;
++
+     final Widget withActionBar = Stack(
+       clipBehavior: Clip.none,
+-      fit: StackFit.expand,
+       children: [
+-        unpositioned,
++        // 图片内容：位置与尺寸与改动前一致
++        Positioned(
++          left: pad,
++          top: pad,
++          width: boxWidth,
++          height: boxHeight,
++          child: unpositioned,
++        ),
++
++        // 缩放把手：父级是放大后的格子，所以跨在边框外的那一半也能点到
++        if (showResizeHandles)
++          for (double x = -20; x <= 20; x += 20)
++            for (double y = -20; y <= 20; y += 20)
++              if (x != 0 || y != 0) // ignore (0,0)
++                _CanvasImageResizeHandle(
++                  active: active,
++                  position: Offset(x, y),
++                  image: widget.image,
++                  parent: this,
++                  afterDrag: () => setState(() {}),
++                ),
++
++        // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）
++        if (_cropping)
++          Positioned(
++            left: 0,
++            top: 0,
++            width: boxWidth + pad * 2,
++            height: boxHeight + pad * 2,
++            child: ImageCropOverlay(
++              padding: pad,
++              cropRect: _pendingCrop,
++              sourceSize: widget.image.naturalSize,
++              boxSize: Size(boxWidth, boxHeight),
++              onChanged: (cropRect) => setState(() => _pendingCrop = cropRect),
++            ),
++          ),
++
++        // 个人自用版：选中时在图片**下方**浮出动作条
+         if (active && !widget.readOnly && !widget.isBackground)
+           Positioned(
+             left: 0,
+             right: 0,
+-            top: boxHeight + 8,
++            top: pad + boxHeight + 8,
+             child: DeferPointer(
+               paintOnTop: true,
+               child: Center(
+@@ -446,10 +476,15 @@ class _CanvasImageState extends State<CanvasImage> {
+           : const Duration(milliseconds: 300),
+       curve: Curves.fastLinearToSlowEaseIn,
+ 
+-      left: widget.image.dstRect.left,
+-      top: widget.image.dstRect.top,
+-      width: max(widget.image.dstRect.width, CanvasImage.minInteractiveSize),
+-      height: max(widget.image.dstRect.height, CanvasImage.minInteractiveSize),
++      // 格子往外扩 pad；图片内容在上面补回了 pad，所以视觉位置不变
++      left: widget.image.dstRect.left - pad,
++      top: widget.image.dstRect.top - pad,
++      width:
++          max(widget.image.dstRect.width, CanvasImage.minInteractiveSize) +
++          pad * 2,
++      height:
++          max(widget.image.dstRect.height, CanvasImage.minInteractiveSize) +
++          pad * 2,
+ 
+       child: withActionBar,
+     );
+@@ -512,9 +547,25 @@ class _CanvasImageResizeHandle extends StatelessWidget {
+   @override
+   Widget build(BuildContext context) {
+     final colorScheme = ColorScheme.of(context);
++    // 把手的父级是"放大后的图片格子"，图片内容从 handlePadding 处开始
++    final double boxWidth = max(
++      image.dstRect.width,
++      CanvasImage.minInteractiveSize,
++    );
++    final double boxHeight = max(
++      image.dstRect.height,
++      CanvasImage.minInteractiveSize,
++    );
++    const double half = CanvasImage.handleSize / 2;
+     return Positioned(
+-      left: (position.dx.sign + 1) / 2 * image.dstRect.width - 20,
+-      top: (position.dy.sign + 1) / 2 * image.dstRect.height - 20,
++      left:
++          CanvasImage.handlePadding +
++          (position.dx.sign + 1) / 2 * boxWidth -
++          half,
++      top:
++          CanvasImage.handlePadding +
++          (position.dy.sign + 1) / 2 * boxHeight -
++          half,
+       child: DeferPointer(
+         paintOnTop: true,
+         child: MouseRegion(
+@@ -618,8 +669,8 @@ class _CanvasImageResizeHandle extends StatelessWidget {
+               opacity: active ? 1 : 0,
+               duration: const Duration(milliseconds: 100),
+               child: Container(
+-                width: 40,
+-                height: 40,
++                width: CanvasImage.handleSize,
++                height: CanvasImage.handleSize,
+                 decoration: BoxDecoration(
+                   color: colorScheme.onSurface,
+                   shape: .circle,
+diff --git a/lib/components/canvas/image_crop_overlay.dart b/lib/components/canvas/image_crop_overlay.dart
+index 9da180c2..4f6e8767 100644
+--- a/lib/components/canvas/image_crop_overlay.dart
++++ b/lib/components/canvas/image_crop_overlay.dart
+@@ -11,6 +11,10 @@ import 'package:flutter/material.dart';
+ /// 坐标系：`cropRect` / `sourceSize` 是**源图像素**，`boxSize` 是图片在屏幕上
+ /// 的显示尺寸。本 widget 只负责交互与显示，裁剪框的真值由父级持有，
+ /// 每次变化通过 [onChanged] 上报（单向数据流，父级重建）。
++///
++/// [padding] 是本 widget 比图片大出来的那一圈：它**属于本 widget 的可命中的
++/// 范围**。把手跨在裁剪框的边上，一半在框外，如果没有这一圈，那半边就
++/// 既看得见又点不到（Flutter 的命中测试受自身尺寸限制）。
+ class ImageCropOverlay extends StatelessWidget {
+   const new({
+     super.key,
+@@ -18,6 +22,7 @@ class ImageCropOverlay extends StatelessWidget {
+     required this.sourceSize,
+     required this.boxSize,
+     required this.onChanged,
++    this.padding = 0,
+   });
+ 
+   /// 当前裁剪框，单位是源图像素。
+@@ -32,19 +37,23 @@ class ImageCropOverlay extends StatelessWidget {
+   /// 裁剪框变化时回调（参数为新的裁剪框，源图像素）。
+   final ValueChanged<Rect> onChanged;
+ 
++  /// 图片四周额外留出的可命中余量。应 >= [handleSize] / 2。
++  final double padding;
++
+   /// 裁剪框的最小边长，单位源图像素。防止拖成一条线。
+   static const minCropSize = 24.0;
+ 
+-  /// 把手（拖动点）的直径。
+-  static const _handleSize = 40.0;
++  /// 把手（拖动点）的直径，与 `CanvasImage.handleSize` 保持一致。
++  static const handleSize = 44.0;
+ 
+-  /// 把源图像素的矩形换算成显示坐标。
+-  static Rect toDisplay(Rect rect, Size sourceSize, Size boxSize) => Rect.fromLTRB(
+-    rect.left / sourceSize.width * boxSize.width,
+-    rect.top / sourceSize.height * boxSize.height,
+-    rect.right / sourceSize.width * boxSize.width,
+-    rect.bottom / sourceSize.height * boxSize.height,
+-  );
++  /// 把源图像素的矩形换算成显示坐标（不含 [padding]）。
++  static Rect toDisplay(Rect rect, Size sourceSize, Size boxSize) =>
++      Rect.fromLTRB(
++        rect.left / sourceSize.width * boxSize.width,
++        rect.top / sourceSize.height * boxSize.height,
++        rect.right / sourceSize.width * boxSize.width,
++        rect.bottom / sourceSize.height * boxSize.height,
++      );
+ 
+   /// 屏幕上的位移换算成源图像素上的位移。
+   Offset _toSourceDelta(Offset delta) => Offset(
+@@ -63,10 +72,21 @@ class ImageCropOverlay extends StatelessWidget {
+     // 每条边都夹在 [图片边界] 与 [对面的边 - 最小尺寸] 之间。
+     // cropRect 始终保证 width/height >= minCropSize，所以这里的夹取下界
+     // 一定不会超过上界。
+-    if (position.dx < 0) left = (left + sourceDelta.dx).clamp(0.0, right - minCropSize);
+-    if (position.dx > 0) right = (right + sourceDelta.dx).clamp(left + minCropSize, sourceSize.width);
+-    if (position.dy < 0) top = (top + sourceDelta.dy).clamp(0.0, bottom - minCropSize);
+-    if (position.dy > 0) bottom = (bottom + sourceDelta.dy).clamp(top + minCropSize, sourceSize.height);
++    if (position.dx < 0) {
++      left = (left + sourceDelta.dx).clamp(0.0, right - minCropSize);
++    }
++    if (position.dx > 0) {
++      right = (right + sourceDelta.dx).clamp(left + minCropSize, sourceSize.width);
++    }
++    if (position.dy < 0) {
++      top = (top + sourceDelta.dy).clamp(0.0, bottom - minCropSize);
++    }
++    if (position.dy > 0) {
++      bottom = (bottom + sourceDelta.dy).clamp(
++        top + minCropSize,
++        sourceSize.height,
++      );
++    }
+ 
+     onChanged(Rect.fromLTRB(left, top, right, bottom));
+   }
+@@ -90,41 +110,52 @@ class ImageCropOverlay extends StatelessWidget {
+     );
+   }
+ 
++  /// 把手的 key，便于测试按位置精确点到某个把手。
++  @visibleForTesting
++  static Key handleKey(Offset position) =>
++      ValueKey('cropHandle${position.dx},${position.dy}');
++
+   @override
+   Widget build(BuildContext context) {
+-    final display = toDisplay(cropRect, sourceSize, boxSize);
++    // 图片本身占的区域（本 widget 的坐标里要偏移 padding）
++    final imageBox = Rect.fromLTWH(
++      padding,
++      padding,
++      boxSize.width,
++      boxSize.height,
++    );
++    // 裁剪框的显示位置
++    final display = toDisplay(
++      cropRect,
++      sourceSize,
++      boxSize,
++    ).shift(Offset(padding, padding));
+     final scrim = Colors.black.withValues(alpha: 0.45);
+ 
+     return Stack(
++      clipBehavior: Clip.none,
+       children: [
+-        // 裁剪框以外的四个方向压暗
+-        Positioned(
+-          left: 0,
+-          top: 0,
+-          width: boxSize.width,
+-          height: max(0, display.top),
+-          child: ColoredBox(color: scrim),
++        // 裁剪框以外的四个方向压暗（只在图片范围内，不压暗外面那一圈余量）
++        _scrim(
++          Rect.fromLTRB(imageBox.left, imageBox.top, imageBox.right, display.top),
++          scrim,
+         ),
+-        Positioned(
+-          left: 0,
+-          top: display.bottom,
+-          width: boxSize.width,
+-          height: max(0, boxSize.height - display.bottom),
+-          child: ColoredBox(color: scrim),
++        _scrim(
++          Rect.fromLTRB(
++            imageBox.left,
++            display.bottom,
++            imageBox.right,
++            imageBox.bottom,
++          ),
++          scrim,
+         ),
+-        Positioned(
+-          left: 0,
+-          top: display.top,
+-          width: max(0, display.left),
+-          height: display.height,
+-          child: ColoredBox(color: scrim),
++        _scrim(
++          Rect.fromLTRB(imageBox.left, display.top, display.left, display.bottom),
++          scrim,
+         ),
+-        Positioned(
+-          left: display.right,
+-          top: display.top,
+-          width: max(0, boxSize.width - display.right),
+-          height: display.height,
+-          child: ColoredBox(color: scrim),
++        _scrim(
++          Rect.fromLTRB(display.right, display.top, imageBox.right, display.bottom),
++          scrim,
+         ),
+ 
+         // 框内拖动 = 整体移动裁剪框（放在把手下面，避免盖住把手）
+@@ -161,10 +192,13 @@ class ImageCropOverlay extends StatelessWidget {
+     );
+   }
+ 
+-  /// 把手的 key，便于测试按位置精确点到某个把手。
+-  @visibleForTesting
+-  static Key handleKey(Offset position) =>
+-      ValueKey('cropHandle${position.dx},${position.dy}');
++  Widget _scrim(Rect rect, Color color) => Positioned(
++    left: rect.left,
++    top: rect.top,
++    width: max(0, rect.width),
++    height: max(0, rect.height),
++    child: ColoredBox(color: color),
++  );
+ 
+   Widget _handle(BuildContext context, Offset position, Rect display) {
+     final colorScheme = ColorScheme.of(context);
+@@ -174,11 +208,11 @@ class ImageCropOverlay extends StatelessWidget {
+       left:
+           display.left +
+           (position.dx + 1) / 2 * display.width -
+-          _handleSize / 2,
++          handleSize / 2,
+       top:
+           display.top +
+           (position.dy + 1) / 2 * display.height -
+-          _handleSize / 2,
++          handleSize / 2,
+       child: MouseRegion(
+         cursor: SystemMouseCursors.precise,
+         child: GestureDetector(
+@@ -186,8 +220,8 @@ class ImageCropOverlay extends StatelessWidget {
+           behavior: HitTestBehavior.opaque,
+           onPanUpdate: (details) => _dragHandle(position, details.delta),
+           child: Container(
+-            width: _handleSize,
+-            height: _handleSize,
++            width: handleSize,
++            height: handleSize,
+             decoration: BoxDecoration(
+               color: colorScheme.onSurface,
+               shape: .circle,
+diff --git a/test/image_crop_overlay_test.dart b/test/image_crop_overlay_test.dart
+index f7172758..9d552826 100644
+--- a/test/image_crop_overlay_test.dart
++++ b/test/image_crop_overlay_test.dart
+@@ -39,6 +39,62 @@ void main() {
+       expect(_center(tester, const Offset(-1, 0)), const Offset(25, 50));
+       expect(_center(tester, const Offset(1, 0)), const Offset(75, 50));
+     });
++
++    testWidgets(
++      'with padding, handles straddle the edge but stay fully hittable',
++      (tester) async {
++        // 这正是"小圆点总是点不到"的修复所依赖的性质：
++        // 把手中心仍然压在图片边界上（视觉不变），但整圆都落在
++        // 本 widget 的范围内，所以外面那一半也有命中测试。
++        const pad = 28.0;
++        await tester.pumpWidget(
++          _wrap(
++            ImageCropOverlay(
++              padding: pad,
++              // 裁剪框 = 整张图 → 把手正好压在图片的四条边界上
++              cropRect: fullCrop,
++              sourceSize: sourceSize,
++              boxSize: boxSize,
++              onChanged: (_) {},
++            ),
++            size: 100 + pad * 2,
++          ),
++        );
++
++        final overlayRect = tester.getRect(find.byType(ImageCropOverlay));
++        expect(
++          overlayRect.size,
++          const Size(100 + pad * 2, 100 + pad * 2),
++          reason: 'the padding ring is part of this widget, so it is hittable',
++        );
++        final imageOrigin = overlayRect.topLeft + const Offset(pad, pad);
++
++        for (final position in _allHandlePositions) {
++          final rect = tester.getRect(
++            find.byKey(ImageCropOverlay.handleKey(position)),
++          );
++          expect(
++            rect.center,
++            imageOrigin +
++                Offset(
++                  (position.dx + 1) / 2 * 100,
++                  (position.dy + 1) / 2 * 100,
++                ),
++            reason: '$position should still be centred on the image edge',
++          );
++          expect(
++            overlayRect.inflate(-0.5).contains(rect.topLeft),
++            isTrue,
++            reason: '$position handle sticks out of the hittable area',
++          );
++          expect(
++            overlayRect.inflate(-0.5).contains(rect.bottomRight),
++            isTrue,
++            reason: '$position handle sticks out of the hittable area',
++          );
++        }
++      },
++    );
+   });
+ 
+   group('拖动把手改裁剪框', () {
+@@ -146,6 +202,18 @@ void main() {
+   });
+ }
+ 
++/// 8 个把手的位置（-1/0/1 的笛卡尔积去掉中心）。
++const _allHandlePositions = [
++  Offset(-1, -1),
++  Offset(-1, 0),
++  Offset(-1, 1),
++  Offset(0, -1),
++  Offset(0, 1),
++  Offset(1, -1),
++  Offset(1, 0),
++  Offset(1, 1),
++];
++
+ /// 把手中心相对裁剪层左上角的位置（即"显示坐标"）。
+ Offset _center(WidgetTester tester, Offset position) {
+   final origin = tester.getTopLeft(find.byType(ImageCropOverlay));
+@@ -183,6 +251,6 @@ Future<Rect?> _drag(
+   return changed;
+ }
+ 
+-Widget _wrap(Widget child) => MaterialApp(
+-  home: Center(child: SizedBox(width: 100, height: 100, child: child)),
++Widget _wrap(Widget child, {double size = 100}) => MaterialApp(
++  home: Center(child: SizedBox(width: size, height: size, child: child)),
+ );

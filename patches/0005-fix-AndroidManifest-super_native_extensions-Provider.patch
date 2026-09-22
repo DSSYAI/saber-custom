@@ -1,0 +1,60 @@
+From ead39f5d06023275738d71e80f7d05faf1944123 Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sat, 19 Sep 2026 13:50:04 +0800
+Subject: [PATCH 05/14] =?UTF-8?q?fix:=20=E7=A7=BB=E9=99=A4=20AndroidManife?=
+ =?UTF-8?q?st=20=E4=B8=AD=20super=5Fnative=5Fextensions=20=E7=9A=84?=
+ =?UTF-8?q?=E9=81=97=E7=95=99=20Provider=EF=BC=88=E4=BF=AE=E5=A4=8D?=
+ =?UTF-8?q?=E5=90=AF=E5=8A=A8=E9=97=AA=E9=80=80=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+移除 super_clipboard 依赖时漏了同步 AndroidManifest.xml。该清单里有一段上游
+为 super_clipboard 手工声明的 ContentProvider：
+
+    <provider
+        android:name="com.superlist.super_native_extensions.DataProvider"
+        android:authorities="com.adilhanney.saber.SuperClipboardDataProvider"
+        android:exported="true"
+        android:grantUriPermissions="true" />
+
+super_native_extensions 已随 super_clipboard 一起从依赖中消失，类不在 APK 里，
+但清单仍声明它。Android 会在应用进程启动、Activity 起来之前实例化所有声明的
+ContentProvider，因此抛 ClassNotFoundException，表现为装好后点开立刻闪退。
+
+排查证据：APK 合并后的清单里该 provider 仍存在，而 3 个 classes*.dex 中
+完全搜不到 super_native_extensions 这一符号。
+
+修复后已验证：
+- 新 APK 的合并清单里该 provider 已消失
+- 逐一核对清单中全部组件声明（activity/provider/receiver/service）对应的类
+  都能在 dex 中找到，确认不存在同类遗留问题
+- lib/ 仍只含 arm64-v8a；apksigner 校验通过
+
+教训：删除 Flutter 插件依赖时，除 Dart 代码与 pubspec 外，必须检查
+AndroidManifest.xml 中是否手工声明了该插件的组件。
+---
+ android/app/src/main/AndroidManifest.xml | 10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index f547ace2..368808f6 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -115,12 +115,10 @@
+                android:value="true" />
+        </service>
+ 
+-       <provider
+-           android:name="com.superlist.super_native_extensions.DataProvider"
+-           android:authorities="com.adilhanney.saber.SuperClipboardDataProvider"
+-           android:exported="true"
+-           android:grantUriPermissions="true" >
+-       </provider>
++       <!-- 个人自用版：此处原有 super_native_extensions 的 DataProvider 声明，
++            它只服务于 super_clipboard（用于剪贴板图片粘贴）。该依赖已随 Rust
++            构建链一起移除，若保留这段声明，Android 会在进程启动时实例化这个
++            已不存在的 ContentProvider 并抛 ClassNotFoundException，导致应用闪退。 -->
+ 
+         <!-- Don't delete the meta-data below.
+              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

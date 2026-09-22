@@ -1,0 +1,449 @@
+From eb0a375c4e45cda89e50630f319f9f0ec72cdebf Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 11:26:15 +0800
+Subject: [PATCH 08/14] =?UTF-8?q?fix(image):=20=E8=AE=A9=20srcRect=20?=
+ =?UTF-8?q?=E7=9C=9F=E6=AD=A3=E5=85=85=E5=BD=93=E8=A3=81=E5=89=AA=E6=A1=86?=
+ =?UTF-8?q?=EF=BC=88=E8=A3=81=E5=89=AA=E5=8A=9F=E8=83=BD=E7=9A=84=E5=89=8D?=
+ =?UTF-8?q?=E7=BD=AE=E4=BF=AE=E5=A4=8D=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+srcRect（存进笔记是 sx/sy/sw/sh）一直是显示源图的哪一块，但渲染路径
+从来没真正用它：canvas_image.dart 里的
+  SizedOverflowBox(size: srcRect.size) + Transform.translate(-srcRect.topLeft)
+在外层紧约束下是个空操作 —— Flutter SDK 的
+RenderSizedOverflowBox.performLayout 是用**父约束**布局子节点的
+（rendering/shifted_box.dart:1122-1128），而 srcRect.topLeft 又恒为 (0,0)。
+历史也印证了：2023 年那次正确的实现（2a913493，用 drawImageRect(src: srcRect)）
+后来被改掉了，当前代码里 drawImageRect/applyBoxFit 一个都不存在。
+
+后果：直接在此基础上做裁剪 UI，会得到拖了框、点了确认、界面毫无变化的
+静默失效。所以先把渲染补上。
+
+- 新增 CroppedImage：FittedBox(fill) > ClipRect > Align(widthFactor/
+  heightFactor + FractionalOffset) > SizedBox(源图尺寸) > 原图片 widget。
+  未裁剪时的输出与 BoxFit.fill 直接铺满**一致**。
+- CanvasImage.isCropped 判定是否真的裁掉了东西，带 0.5px 容差
+  （未裁剪的值要经过存盘/读盘浮点往返，不能比相等）；
+  srcRect 为零值（PDF 页图）或 naturalSize 未知时一律走老路径。
+- 缩略图一律不走裁剪渲染（其 srcRect 在缩略图坐标系，与 naturalSize 不同源），
+  保持改动前行为。主页卡片预览显示裁剪留待后续批次。
+- 未裁剪时完整保留改动前的渲染分支，golden 测试逐张通过证明输出未变。
+
+新增 test/cropped_image_test.dart：10 个用例，含用真实像素证明裁剪生效
+（红/蓝对半的测试图，裁右半后左边缘也必须是蓝的）。
+---
+ lib/components/canvas/canvas_image.dart  |  66 +++++--
+ lib/components/canvas/cropped_image.dart |  75 ++++++++
+ test/cropped_image_test.dart             | 221 +++++++++++++++++++++++
+ 3 files changed, 350 insertions(+), 12 deletions(-)
+ create mode 100644 lib/components/canvas/cropped_image.dart
+ create mode 100644 test/cropped_image_test.dart
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index 630996f4..8680455c 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -4,6 +4,7 @@ import 'package:defer_pointer/defer_pointer.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:saber/components/canvas/canvas_image_dialog.dart';
++import 'package:saber/components/canvas/cropped_image.dart';
+ import 'package:saber/components/canvas/image/editor_image.dart';
+ import 'package:saber/components/theming/adaptive_alert_dialog.dart';
+ import 'package:saber/data/extensions/change_notifier_extensions.dart';
+@@ -41,6 +42,31 @@ class CanvasImage extends StatefulHookWidget {
+   /// The minimum size of the image itself, inside of the interactive area.
+   static double minImageSize = 10;
+ 
++  /// 个人自用版：判断 [srcRect] 是否真的裁掉了东西。
++  ///
++  /// 未裁剪时 `srcRect` 等于 `(0, 0, naturalSize)`，但这个值会经过存盘/读盘的
++  /// 浮点往返，所以不能直接比相等，用一个像素级的容差。
++  ///
++  /// 缩略图一律返回 false：[PngEditorImage] 的缩略图会把 `srcRect` 按比例缩到
++  /// 缩略图坐标系，而 `naturalSize` 仍是原图尺寸，两者不是同一个坐标系。
++  /// 缩略图保持改动前的渲染行为（主页卡片/页面管理器里的预览也就是说暂不显示裁剪）。
++  @visibleForTesting
++  static bool isCropped({
++    required Rect srcRect,
++    required Size sourceSize,
++    bool isThumbnail = false,
++  }) {
++    if (isThumbnail) return false;
++    if (sourceSize.width <= 0 || sourceSize.height <= 0) return false;
++    if (srcRect.width <= 0 || srcRect.height <= 0) return false;
++
++    const epsilon = 0.5;
++    return srcRect.left.abs() > epsilon ||
++        srcRect.top.abs() > epsilon ||
++        (srcRect.width - sourceSize.width).abs() > epsilon ||
++        (srcRect.height - sourceSize.height).abs() > epsilon;
++  }
++
+   @override
+   State<CanvasImage> createState() => _CanvasImageState();
+ }
+@@ -108,6 +134,21 @@ class _CanvasImageState extends State<CanvasImage> {
+       imageBrightness = currentBrightness;
+     }
+ 
++    final Widget imageWidget = widget.image.buildImageWidget(
++      context: context,
++      overrideBoxFit: widget.overrideBoxFit,
++      isBackground: widget.isBackground,
++      invert: imageBrightness == .dark,
++    );
++
++    // 个人自用版：只有"确实裁剪了"才走裁剪渲染。
++    // 未裁剪时保留改动前的整段渲染，输出逐像素不变（golden 测试守住这一点）。
++    final bool cropped = CanvasImage.isCropped(
++      srcRect: widget.image.srcRect,
++      sourceSize: widget.image.naturalSize,
++      isThumbnail: widget.image.isThumbnail,
++    );
++
+     final Widget unpositioned = IgnorePointer(
+       ignoring: widget.readOnly,
+       child: Stack(
+@@ -189,18 +230,19 @@ class _CanvasImageState extends State<CanvasImage> {
+                             widget.image.dstRect.height,
+                             CanvasImage.minImageSize,
+                           ),
+-                    child: SizedOverflowBox(
+-                      size: widget.image.srcRect.size,
+-                      child: Transform.translate(
+-                        offset: -widget.image.srcRect.topLeft,
+-                        child: widget.image.buildImageWidget(
+-                          context: context,
+-                          overrideBoxFit: widget.overrideBoxFit,
+-                          isBackground: widget.isBackground,
+-                          invert: imageBrightness == .dark,
+-                        ),
+-                      ),
+-                    ),
++                    child: cropped
++                        ? CroppedImage(
++                            srcRect: widget.image.srcRect,
++                            sourceSize: widget.image.naturalSize,
++                            child: imageWidget,
++                          )
++                        : SizedOverflowBox(
++                            size: widget.image.srcRect.size,
++                            child: Transform.translate(
++                              offset: -widget.image.srcRect.topLeft,
++                              child: imageWidget,
++                            ),
++                          ),
+                   ),
+                 ),
+               ),
+diff --git a/lib/components/canvas/cropped_image.dart b/lib/components/canvas/cropped_image.dart
+new file mode 100644
+index 00000000..8ff6ed82
+--- /dev/null
++++ b/lib/components/canvas/cropped_image.dart
+@@ -0,0 +1,75 @@
++import 'package:flutter/material.dart';
++
++/// 个人自用版：只显示 [child] 的一个子矩形（[srcRect]），并拉伸填满可用空间。
++///
++/// Flutter 自带的 [BoxFit] 只能缩放进整张图，无法只显示图的一部分。
++///
++/// Saber 的图片数据里其实早就有 `srcRect` 这个字段（存进笔记是 `sx/sy/sw/sh`，
++/// 见 `image/editor_image.dart`），但**渲染路径从来没有真正用它**：
++/// `canvas_image.dart` 里的 `SizedOverflowBox(size: srcRect.size)` 在外层紧约束下
++/// 是个空操作，而 `srcRect.topLeft` 又恒为 (0,0)。所以过去把 `srcRect` 设成子矩形，
++/// 界面上不会有任何变化 —— 裁剪功能必须先把这段补上。
++///
++/// 坐标系：[srcRect] 与 [sourceSize] 用的是同一个像素坐标系，
++/// 也就是"整张图"的尺寸（缩略图情况见调用方如何处理）。
++///
++/// 未裁剪时本 widget 的输出与 `BoxFit.fill` 直接铺满父约束**一致**，
++/// 所以它可以安全地只用在"确实裁剪了"的分支上。
++class CroppedImage extends StatelessWidget {
++  const new({
++    super.key,
++    required this.srcRect,
++    required this.sourceSize,
++    required this.child,
++  });
++
++  /// 要显示的那块区域，单位是源图像素。
++  final Rect srcRect;
++
++  /// 整张图的像素尺寸，[srcRect] 的坐标系。
++  final Size sourceSize;
++
++  /// 整张图的内容；会被摆放在 [sourceSize] 大小的盒子里，
++  /// 因此任何"铺满"类型的 fit 在这里都是 1:1。
++  final Widget child;
++
++  @override
++  Widget build(BuildContext context) {
++    final sourceWidth = sourceSize.width;
++    final sourceHeight = sourceSize.height;
++    if (srcRect.width <= 0 ||
++        srcRect.height <= 0 ||
++        sourceWidth <= 0 ||
++        sourceHeight <= 0) {
++      return child;
++    }
++
++    // 裁剪窗口在源图里的位置，换算成 0..1 的比例。
++    // 用 FractionalOffset 正好能直接表达"窗口左上角对齐盒子左上角"。
++    final double fractionX = sourceWidth == srcRect.width
++        ? 0
++        : srcRect.left / (sourceWidth - srcRect.width);
++    final double fractionY = sourceHeight == srcRect.height
++        ? 0
++        : srcRect.top / (sourceHeight - srcRect.height);
++
++    return FittedBox(
++      // 与未裁剪时的 BoxFit.fill 行为一致：拉伸填满，不保持比例
++      fit: BoxFit.fill,
++      child: ClipRect(
++        // Align 的 widthFactor/heightFactor 把盒子缩到裁剪区域大小，
++        // 并按 fraction 把整图偏移到正确位置；ClipRect 裁掉窗口外的部分。
++        child: Align(
++          alignment: FractionalOffset(fractionX, fractionY),
++          widthFactor: srcRect.width / sourceWidth,
++          heightFactor: srcRect.height / sourceHeight,
++          child: SizedBox(
++            width: sourceWidth,
++            height: sourceHeight,
++            child: child,
++          ),
++        ),
++      ),
++    );
++  }
++}
+diff --git a/test/cropped_image_test.dart b/test/cropped_image_test.dart
+new file mode 100644
+index 00000000..d510279b
+--- /dev/null
++++ b/test/cropped_image_test.dart
+@@ -0,0 +1,221 @@
++import 'dart:typed_data';
++import 'dart:ui' as ui;
++
++import 'package:flutter/material.dart';
++import 'package:flutter/rendering.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:image/image.dart' as im;
++import 'package:saber/components/canvas/canvas_image.dart';
++import 'package:saber/components/canvas/cropped_image.dart';
++
++/// 个人自用版：裁剪渲染的验证。
++///
++/// 背景：`srcRect`（存进笔记是 `sx/sy/sw/sh`）一直是"显示源图的哪一块"，
++/// 但改动前的渲染路径（`SizedOverflowBox(size: srcRect.size)` + 恒为 (0,0) 的
++/// translate）在外层紧约束下是个空操作，所以把它设成子矩形界面上毫无变化。
++/// 这组测试用真实像素证明裁剪确实生效了。
++void main() {
++  group('CanvasImage.isCropped', () {
++    const source = Size(100, 50);
++    const full = Rect.fromLTWH(0, 0, 100, 50);
++
++    test('the full image is not a crop', () {
++      expect(
++        CanvasImage.isCropped(srcRect: full, sourceSize: source),
++        isFalse,
++      );
++    });
++
++    test('a sub-rect is a crop', () {
++      expect(
++        CanvasImage.isCropped(
++          srcRect: const Rect.fromLTWH(10, 0, 90, 50),
++          sourceSize: source,
++        ),
++        isTrue,
++      );
++      expect(
++        CanvasImage.isCropped(
++          srcRect: const Rect.fromLTWH(0, 0, 100, 25),
++          sourceSize: source,
++        ),
++        isTrue,
++      );
++      expect(
++        CanvasImage.isCropped(
++          srcRect: const Rect.fromLTWH(0, 10, 100, 40),
++          sourceSize: source,
++        ),
++        isTrue,
++      );
++    });
++
++    test('float noise from a save/load round trip is tolerated', () {
++      expect(
++        CanvasImage.isCropped(
++          srcRect: const Rect.fromLTWH(0, 0, 100.2, 49.8),
++          sourceSize: source,
++        ),
++        isFalse,
++      );
++    });
++
++    test('zero rects are not a crop', () {
++      // eg. pdf page images keep srcRect at zero
++      expect(CanvasImage.isCropped(srcRect: Rect.zero, sourceSize: source), isFalse);
++      // eg. an image whose natural size isn't known yet
++      expect(
++        CanvasImage.isCropped(srcRect: full, sourceSize: Size.zero),
++        isFalse,
++      );
++    });
++
++    test('thumbnails are never treated as cropped', () {
++      // a thumbnail's srcRect lives in the thumbnail's coordinate space,
++      // where it doesn't match naturalSize
++      expect(
++        CanvasImage.isCropped(
++          srcRect: const Rect.fromLTWH(10, 5, 40, 20),
++          sourceSize: source,
++          isThumbnail: true,
++        ),
++        isFalse,
++      );
++    });
++  });
++
++  group('CroppedImage', () {
++    // The source is 100x50: left half red, right half blue.
++    const sourceSize = Size(100, 50);
++
++    testWidgets('without a crop, the whole image is shown', (tester) async {
++      final pixels = await _render(tester, srcRect: Offset.zero & sourceSize);
++
++      expect(pixels.at(10, 20), _red, reason: 'left side comes from the red half');
++      expect(pixels.at(70, 20), _blue, reason: 'right side comes from the blue half');
++    });
++
++    testWidgets('cropping the right half hides the red half', (tester) async {
++      final pixels = await _render(
++        tester,
++        srcRect: const Rect.fromLTWH(50, 0, 50, 50),
++      );
++
++      expect(pixels.at(5, 20), _blue);
++      expect(pixels.at(70, 20), _blue);
++    });
++
++    testWidgets('cropping the left half hides the blue half', (tester) async {
++      final pixels = await _render(
++        tester,
++        srcRect: const Rect.fromLTWH(0, 0, 50, 50),
++      );
++
++      expect(pixels.at(5, 20), _red);
++      expect(pixels.at(70, 20), _red);
++    });
++
++    testWidgets('the cropped region is stretched across the whole box', (
++      tester,
++    ) async {
++      // source x 25..75 => the left 40% of the box is red, the right 60% blue
++      final pixels = await _render(
++        tester,
++        srcRect: const Rect.fromLTWH(25, 0, 50, 50),
++      );
++
++      expect(pixels.at(2, 20), _red, reason: 'just inside the left edge');
++      expect(pixels.at(30, 20), _red, reason: 'source x=44, still red');
++      expect(pixels.at(50, 20), _blue, reason: 'source x=56, now blue');
++      expect(pixels.at(77, 20), _blue, reason: 'just inside the right edge');
++    });
++
++    testWidgets('cropping vertically works too', (tester) async {
++      // the source is horizontally split, so crop a tall thin strip and only
++      // check that it renders without the other axis leaking in
++      final pixels = await _render(
++        tester,
++        srcRect: const Rect.fromLTWH(0, 0, 100, 25),
++      );
++
++      expect(pixels.at(10, 2), _red);
++      expect(pixels.at(70, 2), _blue);
++    });
++  });
++}
++
++const _red = (r: 255, g: 0, b: 0);
++const _blue = (r: 0, g: 0, b: 255);
++
++final _boundaryKey = GlobalKey();
++
++/// Renders [CroppedImage] with a red/blue test image and returns the pixels.
++Future<_Pixels> _render(
++  WidgetTester tester, {
++  required Rect srcRect,
++}) async {
++  late ui.Image source;
++  await tester.runAsync(() async {
++    source = await _redBlueImage();
++  });
++
++  await tester.pumpWidget(
++    MaterialApp(
++      home: Center(
++        child: RepaintBoundary(
++          key: _boundaryKey,
++          child: SizedBox(
++            width: 80,
++            height: 40,
++            child: CroppedImage(
++              srcRect: srcRect,
++              sourceSize: const Size(100, 50),
++              child: RawImage(image: source, fit: BoxFit.fill),
++            ),
++          ),
++        ),
++      ),
++    ),
++  );
++  await tester.pumpAndSettle();
++
++  late _Pixels pixels;
++  await tester.runAsync(() async {
++    final boundary = tester.renderObject<RenderRepaintBoundary>(
++      find.byKey(_boundaryKey),
++    );
++    final rendered = await boundary.toImage(pixelRatio: 1);
++    final data = await rendered.toByteData(format: ui.ImageByteFormat.rawRgba);
++    pixels = _Pixels(data!, 80, 40);
++    rendered.dispose();
++  });
++  return pixels;
++}
++
++/// A 100x50 image: left half red, right half blue.
++Future<ui.Image> _redBlueImage() async {
++  final image = im.Image(width: 100, height: 50);
++  for (var y = 0; y < 50; y++) {
++    for (var x = 0; x < 100; x++) {
++      final isLeft = x < 50;
++      image.setPixelRgba(x, y, isLeft ? 255 : 0, 0, isLeft ? 0 : 255, 255);
++    }
++  }
++  final codec = await ui.instantiateImageCodec(
++    Uint8List.fromList(im.encodePng(image)),
++  );
++  final frame = await codec.getNextFrame();
++  return frame.image;
++}
++
++class _Pixels(final ByteData data, final int width, final int height) {
++  ({int r, int g, int b}) at(int x, int y) {
++    assert(x >= 0 && x < width && y >= 0 && y < height);
++    final offset = (y * width + x) * 4;
++    return (
++      r: data.getUint8(offset),
++      g: data.getUint8(offset + 1),
++      b: data.getUint8(offset + 2),
++    );
++  }
++}

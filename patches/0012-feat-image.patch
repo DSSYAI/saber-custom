@@ -1,0 +1,931 @@
+From fcd61c0c98394658b6e1555f9fcc7de7c004f98c Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 15:05:37 +0800
+Subject: [PATCH 12/14] =?UTF-8?q?feat(image):=20=E8=87=AA=E7=94=B1?=
+ =?UTF-8?q?=E6=97=8B=E8=BD=AC=EF=BC=88=E6=8B=96=E5=8A=A8=E5=9B=BE=E7=89=87?=
+ =?UTF-8?q?=E4=B8=8A=E6=96=B9=E7=9A=84=E6=97=8B=E8=BD=AC=E7=AE=AD=E5=A4=B4?=
+ =?UTF-8?q?=EF=BC=89+=20=E6=B0=B4=E5=B9=B3=E7=BF=BB=E8=BD=AC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按之前定下的做法实现：不要 90 度一档的按钮，而是图片上方一个旋转箭头，
+直接拖着转。
+
+旋转
+- 新增 EditorImage.rotationDegrees（度，顺时针为正）。纯显示变换，
+  不动原始像素；裁剪框 srcRect 始终在**未旋转**的源图坐标系里，两者互不干扰
+- 旋转箭头放在图片正上方（圆心压在图片上边缘），靠第六批那个
+  handlePadding 余量保证整圆都可点
+- 它占的位置原本是"顶部中间那个缩放把手"，所以撤掉那一个
+  （顶部仍可用两个上角拉伸），否则两者完全重叠
+- 拖动算法：按下时记下"指针相对图片中心的角度"和当时的 rotationDegrees，
+  拖动时按角度差累加，所以转起来跟手
+- 吸附：角度接近 90 的整数倍（±5 度内）时吸附过去，并归一到 (-180, 180]。
+  没有吸附的话手动几乎转不回正；只在接近时吸附，所以自由旋转不受影响
+- 旋转后的外接矩形大于格子，所以按比例缩回格子内，否则四角会被裁掉
+
+翻转
+- 新增 EditorImage.flipHorizontal，动作条上的「水平翻转」按钮
+
+裁剪模式下刻意**不套用**旋转/翻转：裁剪框永远在未旋转未翻转的源图坐标系里，
+不然用户看到的图和裁剪框对不上。
+
+撤消：EditorHistoryItem 新增 changeOrientation 类型 + Change<ImageOrientation>
+（ImageOrientation 是 rotationDegrees + flipHorizontal 的记录别名），
+undo/redo 两个 switch 都补了分支。
+
+「重置裁剪」改名「重置」：现在它把裁剪、旋转、翻转**全部**恢复默认
+（任何一项非默认时才出现）。三项都改过时撤销需要按两次，这是刻意的：
+两条记录是两件事，分开撤销更符合直觉。
+
+测试：新增 test/image_orientation_test.dart（8 例），覆盖吸附规则
+（接近才吸、远离不吸、归一范围）和字段的存档往返。写测试时当场发现一处
+范围不一致：吸附可能把 -177 变成 -180，与文档写的 (-180, 180] 不符，
+已把 -180 统一规范化成 180（两者是同一个角度）。
+---
+ lib/components/canvas/canvas_image.dart       | 300 +++++++++++++++---
+ lib/components/canvas/image/editor_image.dart |  37 +++
+ .../canvas/image/pdf_editor_image.dart        |   9 +-
+ .../canvas/image/png_editor_image.dart        |   9 +-
+ .../canvas/image/svg_editor_image.dart        |   9 +-
+ lib/data/editor/editor_history.dart           |  13 +
+ lib/pages/editor/editor.dart                  |  37 ++-
+ test/image_orientation_test.dart              | 127 ++++++++
+ 8 files changed, 500 insertions(+), 41 deletions(-)
+ create mode 100644 test/image_orientation_test.dart
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index 6b053bb4..b2c98692 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -81,6 +81,25 @@ class CanvasImage extends StatefulHookWidget {
+         (srcRect.height - sourceSize.height).abs() > epsilon;
+   }
+ 
++  /// 个人自用版：把旋转角度归一到 (-180, 180]，并且**接近 90 的整数倍时吸附过去**。
++  ///
++  /// 没有吸附的话，手动几乎不可能把图转回正的（拖动精度太差）；
++  /// 只有接近时才吸附，所以不影响自由旋转。
++  @visibleForTesting
++  static double normaliseRotationDegrees(double degrees) {
++    var value = degrees % 360;
++    if (value > 180) value -= 360;
++    if (value <= -180) value += 360;
++
++    final nearestQuarter = (value / 90).round() * 90.0;
++    final snapped = (value - nearestQuarter).abs() <= 5
++        ? nearestQuarter
++        : value;
++    // 规范化到 (-180, 180]：-180 与 180 是同一个角度，统一用 180，
++    // 免得存进笔记里出现两种写法（吸附可能把 -177 变成 -180）
++    return snapped == -180 ? 180 : snapped;
++  }
++
+   /// 个人自用版：当前是否有图片处于裁剪模式。
+   ///
+   /// 画布（InnerCanvas）监听它，在裁剪时铺一层透明的"点空白处完成裁剪"捕获层。
+@@ -195,18 +214,97 @@ class _CanvasImageState extends State<CanvasImage> {
+     widget.image.onCropImage?.call(widget.image, previous, next);
+   }
+ 
+-  /// 个人自用版：把裁剪恢复成整张图（同样记一条撤销）。
+-  void resetCrop() {
++  /// 个人自用版：把裁剪、旋转、翻转**全部**恢复默认（每一步各记一条撤销）。
++  ///
++  /// 原来的「重置裁剪」只重置裁剪，现在旋转/翻转也归它管，所以按钮改叫「重置」。
++  /// 极端情况下（裁剪和方向都改过）撤销需要按两次，这是刻意的：
++  /// 两条记录是两件事，分开撤销更符合直觉。
++  void resetImageAdjustments() {
+     final image = widget.image;
+-    final previous = image.srcRect;
++    final previousCrop = image.srcRect;
++    final previousOrientation = image.orientation;
+     final full = Offset.zero & image.naturalSize;
+-    if (full.width <= 0 || previous == full) return;
++    const defaultOrientation = (rotationDegrees: 0.0, flipHorizontal: false);
++
++    final cropChanged = full.width > 0 && previousCrop != full;
++    final orientationChanged = previousOrientation != defaultOrientation;
++    if (!cropChanged && !orientationChanged) return;
++
++    setState(() {
++      if (cropChanged) {
++        image.srcRect = full;
++        image.notifySrcRectChanged();
++      }
++      // orientation 的 setter 会 notifyListeners
++      if (orientationChanged) image.orientation = defaultOrientation;
++    });
++
++    if (cropChanged) image.onCropImage?.call(image, previousCrop, full);
++    if (orientationChanged) {
++      image.onOrientationChange?.call(
++        image,
++        previousOrientation,
++        defaultOrientation,
++      );
++    }
++  }
++
++  /// 个人自用版：水平翻转（左右镜像）。
++  void flipImageHorizontal() {
++    final image = widget.image;
++    final before = image.orientation;
++    setState(() {
++      image.flipHorizontal = !image.flipHorizontal;
++    });
++    image.onOrientationChange?.call(image, before, image.orientation);
++  }
++
++  double? _rotatePointerStartDegrees;
++  double? _rotateImageStartDegrees;
++
++  void startRotate(Offset globalPosition) {
++    _rotatePointerStartDegrees = _angleFromImageCentre(globalPosition);
++    _rotateImageStartDegrees = widget.image.rotationDegrees;
++  }
++
++  void updateRotate(Offset globalPosition) {
++    final pointerStart = _rotatePointerStartDegrees;
++    final imageStart = _rotateImageStartDegrees;
++    if (pointerStart == null || imageStart == null) return;
+ 
++    final delta = _angleFromImageCentre(globalPosition) - pointerStart;
+     setState(() {
+-      image.srcRect = full;
+-      image.notifySrcRectChanged();
++      widget.image.rotationDegrees = CanvasImage.normaliseRotationDegrees(
++        imageStart + delta,
++      );
+     });
+-    image.onCropImage?.call(image, previous, full);
++  }
++
++  void endRotate() {
++    final imageStart = _rotateImageStartDegrees;
++    _rotatePointerStartDegrees = null;
++    _rotateImageStartDegrees = null;
++    if (imageStart == null) return;
++    if (imageStart == widget.image.rotationDegrees) return;
++
++    widget.image.onOrientationChange?.call(
++      widget.image,
++      (
++        rotationDegrees: imageStart,
++        flipHorizontal: widget.image.flipHorizontal,
++      ),
++      widget.image.orientation,
++    );
++  }
++
++  /// 指针相对图片中心的角度（度，顺时针为正，正上方为 0）。
++  double _angleFromImageCentre(Offset globalPosition) {
++    final box = context.findRenderObject() as RenderBox?;
++    if (box == null || !box.hasSize) return 0;
++    final centre = box.size.center(Offset.zero);
++    final vector = box.globalToLocal(globalPosition) - centre;
++    // 旋转箭头在正上方，所以 0 度对应"指针在中心正上方"
++    return atan2(vector.dx, -vector.dy) * 180 / pi;
+   }
+ 
+   /// 个人自用版：切换"强制反色"。
+@@ -290,6 +388,51 @@ class _CanvasImageState extends State<CanvasImage> {
+         ? widget.pageSize.height
+         : max(widget.image.dstRect.height, CanvasImage.minImageSize);
+ 
++    // 个人自用版：裁剪结果 / 原图内容
++    final Widget imageContent = cropped
++        ? CroppedImage(
++            srcRect: widget.image.srcRect,
++            sourceSize: widget.image.naturalSize,
++            child: imageWidget,
++          )
++        : SizedOverflowBox(
++            size: widget.image.srcRect.size,
++            child: Transform.translate(
++              offset: -widget.image.srcRect.topLeft,
++              child: imageWidget,
++            ),
++          );
++
++    // 个人自用版：旋转 + 水平翻转。
++    //
++    // 裁剪模式下**不套用**：裁剪框永远在"未旋转、未翻转"的源图坐标系里，
++    // 如果这时还套着旋转，用户看到的图和裁剪框就对不上了。
++    //
++    // 旋转是绕格子中心转的，转完的外接矩形会大于格子，所以要按比例缩回去，
++    // 否则四个角会被裁掉（格子外没有绘制区域）。
++    Widget displayImage = imageContent;
++    if (!_cropping) {
++      if (widget.image.flipHorizontal) {
++        displayImage = Transform.scale(scaleX: -1, child: displayImage);
++      }
++      final double degrees = widget.image.rotationDegrees;
++      if (degrees != 0) {
++        final double radians = degrees * pi / 180;
++        final double cosA = cos(radians).abs();
++        final double sinA = sin(radians).abs();
++        final double boundsWidth = boxWidth * cosA + boxHeight * sinA;
++        final double boundsHeight = boxWidth * sinA + boxHeight * cosA;
++        final double fit = min(
++          boxWidth / boundsWidth,
++          boxHeight / boundsHeight,
++        ).clamp(0.0, 1.0);
++        displayImage = Transform.rotate(
++          angle: radians,
++          child: Transform.scale(scale: fit, child: displayImage),
++        );
++      }
++    }
++
+     final Widget unpositioned = IgnorePointer(
+       ignoring: widget.readOnly,
+       child: Stack(
+@@ -363,19 +506,7 @@ class _CanvasImageState extends State<CanvasImage> {
+                   child: SizedBox(
+                     width: boxWidth,
+                     height: boxHeight,
+-                    child: cropped
+-                        ? CroppedImage(
+-                            srcRect: widget.image.srcRect,
+-                            sourceSize: widget.image.naturalSize,
+-                            child: imageWidget,
+-                          )
+-                        : SizedOverflowBox(
+-                            size: widget.image.srcRect.size,
+-                            child: Transform.translate(
+-                              offset: -widget.image.srcRect.topLeft,
+-                              child: imageWidget,
+-                            ),
+-                          ),
++                    child: displayImage,
+                   ),
+                 ),
+               ),
+@@ -424,18 +555,30 @@ class _CanvasImageState extends State<CanvasImage> {
+           child: unpositioned,
+         ),
+ 
+-        // 缩放把手：父级是放大后的格子，所以跨在边框外的那一半也能点到
++        // 缩放把手：父级是放大后的格子，所以跨在边框外的那一半也能点到。
++        // 顶部中间那个位置让给旋转箭头（顶部仍可用两个上角拉伸）。
+         if (showResizeHandles)
+           for (double x = -20; x <= 20; x += 20)
+             for (double y = -20; y <= 20; y += 20)
+               if (x != 0 || y != 0) // ignore (0,0)
+-                _CanvasImageResizeHandle(
+-                  active: active,
+-                  position: Offset(x, y),
+-                  image: widget.image,
+-                  parent: this,
+-                  afterDrag: () => setState(() {}),
+-                ),
++                if (!(x == 0 && y == -20)) // 让给旋转箭头
++                  _CanvasImageResizeHandle(
++                    active: active,
++                    position: Offset(x, y),
++                    image: widget.image,
++                    parent: this,
++                    afterDrag: () => setState(() {}),
++                  ),
++
++        // 个人自用版：图片上方的旋转箭头，拖动即可自由旋转
++        if (showResizeHandles)
++          _CanvasImageRotateHandle(
++            active: active,
++            image: widget.image,
++            onRotateStart: startRotate,
++            onRotateUpdate: updateRotate,
++            onRotateEnd: endRotate,
++          ),
+ 
+         // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）
+         if (_cropping)
+@@ -465,7 +608,9 @@ class _CanvasImageState extends State<CanvasImage> {
+                 child: _CanvasImageActionBar(
+                   cropping: _cropping,
+                   canCrop: canCrop,
+-                  canResetCrop: imageIsCropped,
++                  canReset:
++                      imageIsCropped ||
++                      widget.image.hasOrientationAdjustments,
+                   imageInverted: widget.image.forceInvert,
+                   canReorder: widget.imageCountOnPage > 1,
+                   onCrop: enterCropMode,
+@@ -476,8 +621,9 @@ class _CanvasImageState extends State<CanvasImage> {
+                   onCancelCrop: () {
+                     setState(() => _exitCropMode(apply: false));
+                   },
+-                  onResetCrop: resetCrop,
++                  onReset: resetImageAdjustments,
+                   onToggleInvert: toggleForceInvert,
++                  onFlipHorizontal: flipImageHorizontal,
+                   onDuplicate: () => widget.image.onImageAction?.call(
+                     widget.image,
+                     .duplicate,
+@@ -725,14 +871,15 @@ class _CanvasImageActionBar extends StatelessWidget {
+   const new({
+     required this.cropping,
+     required this.canCrop,
+-    required this.canResetCrop,
++    required this.canReset,
+     required this.imageInverted,
+     required this.canReorder,
+     required this.onCrop,
+     required this.onFinishCrop,
+     required this.onCancelCrop,
+-    required this.onResetCrop,
++    required this.onReset,
+     required this.onToggleInvert,
++    required this.onFlipHorizontal,
+     required this.onDuplicate,
+     required this.onBringToFront,
+     required this.onSendToBack,
+@@ -741,14 +888,17 @@ class _CanvasImageActionBar extends StatelessWidget {
+ 
+   final bool cropping;
+   final bool canCrop;
+-  final bool canResetCrop;
++
++  /// 是否做过任何可重置的调整（裁剪 / 旋转 / 翻转）。
++  final bool canReset;
+   final bool imageInverted;
+   final bool canReorder;
+   final VoidCallback onCrop;
+   final VoidCallback onFinishCrop;
+   final VoidCallback onCancelCrop;
+-  final VoidCallback onResetCrop;
++  final VoidCallback onReset;
+   final VoidCallback onToggleInvert;
++  final VoidCallback onFlipHorizontal;
+   final VoidCallback onDuplicate;
+   final VoidCallback onBringToFront;
+   final VoidCallback onSendToBack;
+@@ -787,12 +937,12 @@ class _CanvasImageActionBar extends StatelessWidget {
+                   tooltip: '裁剪',
+                   onTap: onCrop,
+                 ),
+-              if (canResetCrop)
++              if (canReset)
+                 _button(
+                   icon: Icons.restart_alt,
+                   // 个人自用版：未走 i18n
+-                  tooltip: '重置裁剪',
+-                  onTap: onResetCrop,
++                  tooltip: '重置（裁剪/旋转/翻转）',
++                  onTap: onReset,
+                 ),
+               _button(
+                 icon: imageInverted
+@@ -802,6 +952,12 @@ class _CanvasImageActionBar extends StatelessWidget {
+                 tooltip: imageInverted ? '取消反色' : '反色',
+                 onTap: onToggleInvert,
+               ),
++              _button(
++                icon: Icons.flip,
++                // 个人自用版：未走 i18n
++                tooltip: '水平翻转',
++                onTap: onFlipHorizontal,
++              ),
+               if (canReorder) ...[
+                 _button(
+                   icon: Icons.flip_to_front,
+@@ -850,3 +1006,73 @@ class _CanvasImageActionBar extends StatelessWidget {
+     );
+   }
+ }
++
++/// 个人自用版：图片正上方的旋转箭头，拖动即可自由旋转。
++///
++/// 它占的位置原本是"顶部中间那个缩放把手"（两者会重叠），所以那个把手
++/// 撤掉了 —— 顶部仍然可以用两个上角拉伸。
++///
++/// 位置：圆心正好压在图片上边缘，靠 [CanvasImage.handlePadding] 那一圈
++/// 提供的可命中区域，所以整圆都点得到（见第六批修的那个 bug）。
++class _CanvasImageRotateHandle extends StatelessWidget {
++  const new({
++    required this.active,
++    required this.image,
++    required this.onRotateStart,
++    required this.onRotateUpdate,
++    required this.onRotateEnd,
++  });
++
++  final bool active;
++  final EditorImage image;
++  final void Function(Offset globalPosition) onRotateStart;
++  final void Function(Offset globalPosition) onRotateUpdate;
++  final VoidCallback onRotateEnd;
++
++  @override
++  Widget build(BuildContext context) {
++    final colorScheme = ColorScheme.of(context);
++    final double boxWidth = max(
++      image.dstRect.width,
++      CanvasImage.minInteractiveSize,
++    );
++    const double size = CanvasImage.handleSize;
++    return Positioned(
++      left: CanvasImage.handlePadding + boxWidth / 2 - size / 2,
++      top: CanvasImage.handlePadding - size / 2,
++      child: DeferPointer(
++        paintOnTop: true,
++        child: MouseRegion(
++          cursor: active ? SystemMouseCursors.grab : MouseCursor.defer,
++          child: GestureDetector(
++            key: const ValueKey('imageRotateHandle'),
++            behavior: HitTestBehavior.opaque,
++            onPanStart: active ? (d) => onRotateStart(d.globalPosition) : null,
++            onPanUpdate: active
++                ? (d) => onRotateUpdate(d.globalPosition)
++                : null,
++            onPanEnd: active ? (_) => onRotateEnd() : null,
++            child: AnimatedOpacity(
++              opacity: active ? 1 : 0,
++              duration: const Duration(milliseconds: 100),
++              child: Container(
++                width: size,
++                height: size,
++                decoration: BoxDecoration(
++                  color: colorScheme.primary,
++                  shape: .circle,
++                  border: Border.all(color: colorScheme.surface, width: 2),
++                ),
++                child: Icon(
++                  Icons.rotate_right,
++                  size: size * 0.6,
++                  color: colorScheme.onPrimary,
++                ),
++              ),
++            ),
++          ),
++        ),
++      ),
++    );
++  }
++}
+diff --git a/lib/components/canvas/image/editor_image.dart b/lib/components/canvas/image/editor_image.dart
+index 0a1c5b92..a84eb5ee 100644
+--- a/lib/components/canvas/image/editor_image.dart
++++ b/lib/components/canvas/image/editor_image.dart
+@@ -29,6 +29,9 @@ part 'svg_editor_image.dart';
+ /// 通过 [EditorImage.onImageAction] 回调过去。
+ enum EditorImageAction { duplicate, bringToFront, sendToBack }
+ 
++/// 个人自用版：一张图片的"方向"（自由旋转 + 水平翻转），用于撤销记录。
++typedef ImageOrientation = ({double rotationDegrees, bool flipHorizontal});
++
+ /// The data for an image in the editor.
+ /// This is listenable for changes to the image's position ([dstRect]).
+ sealed class EditorImage extends ChangeNotifier {
+@@ -67,6 +70,14 @@ sealed class EditorImage extends ChangeNotifier {
+   /// 与 [onCropImage] 一样是可选的字段，不必改三个子类的签名。
+   void Function(EditorImage image, EditorImageAction action)? onImageAction;
+ 
++  /// 个人自用版：旋转/翻转变化时回调（用于撤销）。
++  void Function(
++    EditorImage image,
++    ImageOrientation previous,
++    ImageOrientation current,
++  )?
++  onOrientationChange;
++
+   final VoidCallback? onLoad;
+ 
+   /// 个人自用版：srcRect（裁剪框）变更后通知界面重绘。
+@@ -122,6 +133,28 @@ sealed class EditorImage extends ChangeNotifier {
+   /// （例如把深色截图转成适合打印的浅色）。
+   bool forceInvert;
+ 
++  /// 个人自用版：**显示**时的旋转角度（单位：度，顺时针为正）。
++  ///
++  /// 是自由旋转（拖动图片上方的旋转箭头），但角度接近 90 的整数倍时会吸附过去，
++  /// 否则很难手动转回正。注意这是纯显示变换，不动原始像素，也不影响裁剪框
++  /// （`srcRect` 始终在**未旋转**的源图坐标系里）。
++  double rotationDegrees;
++
++  /// 个人自用版：是否水平翻转（左右镜像）。
++  bool flipHorizontal;
++
++  /// 个人自用版：当前的旋转 + 翻转，用于撤销记录。
++  ImageOrientation get orientation =>
++      (rotationDegrees: rotationDegrees, flipHorizontal: flipHorizontal);
++  set orientation(ImageOrientation value) {
++    rotationDegrees = value.rotationDegrees;
++    flipHorizontal = value.flipHorizontal;
++    notifyListeners();
++  }
++
++  /// 个人自用版：是否做过旋转/翻转（用于决定要不要显示「重置」按钮）。
++  bool get hasOrientationAdjustments => rotationDegrees != 0 || flipHorizontal;
++
+   /// The BoxFit used if this is a page's background image
+   BoxFit backgroundFit;
+ 
+@@ -135,6 +168,8 @@ sealed class EditorImage extends ChangeNotifier {
+     this.naturalSize = .zero,
+     this.invertible = true,
+     this.forceInvert = false,
++    this.rotationDegrees = 0,
++    this.flipHorizontal = false,
+     this.backgroundFit = .contain,
+     required this.onMoveImage,
+     required this.onDeleteImage,
+@@ -189,6 +224,8 @@ sealed class EditorImage extends ChangeNotifier {
+     'i': pageIndex,
+     'v': invertible,
+     if (forceInvert) 'fi': true,
++    if (rotationDegrees != 0) 'r': rotationDegrees,
++    if (flipHorizontal) 'fh': true,
+     'f': backgroundFit.index,
+     'x': dstRect.left,
+     'y': dstRect.top,
+diff --git a/lib/components/canvas/image/pdf_editor_image.dart b/lib/components/canvas/image/pdf_editor_image.dart
+index 080272a8..10217eeb 100644
+--- a/lib/components/canvas/image/pdf_editor_image.dart
++++ b/lib/components/canvas/image/pdf_editor_image.dart
+@@ -25,6 +25,8 @@ class PdfEditorImage extends EditorImage {
+     required super.pageSize,
+     super.invertible,
+     super.forceInvert,
++    super.rotationDegrees,
++    super.flipHorizontal,
+     super.backgroundFit,
+     required super.onMoveImage,
+     required super.onDeleteImage,
+@@ -85,6 +87,8 @@ class PdfEditorImage extends EditorImage {
+       pageSize: .infinite,
+       invertible: json['v'] ?? true,
+       forceInvert: json['fi'] ?? false,
++      rotationDegrees: (json['r'] as num?)?.toDouble() ?? 0,
++      flipHorizontal: json['fh'] ?? false,
+       backgroundFit: json['f'] != null ? .values[json['f']] : .contain,
+       onMoveImage: null,
+       onDeleteImage: null,
+@@ -197,6 +201,8 @@ class PdfEditorImage extends EditorImage {
+     pageSize: .infinite,
+     invertible: invertible,
+     forceInvert: forceInvert,
++    rotationDegrees: rotationDegrees,
++    flipHorizontal: flipHorizontal,
+     backgroundFit: backgroundFit,
+     onMoveImage: onMoveImage,
+     onDeleteImage: onDeleteImage,
+@@ -207,7 +213,8 @@ class PdfEditorImage extends EditorImage {
+     naturalSize: naturalSize,
+     isThumbnail: isThumbnail,
+   )..onCropImage = onCropImage
+-      ..onImageAction = onImageAction;
++      ..onImageAction = onImageAction
++      ..onOrientationChange = onOrientationChange;
+ 
+   @override
+   void dispose() {
+diff --git a/lib/components/canvas/image/png_editor_image.dart b/lib/components/canvas/image/png_editor_image.dart
+index 708e6f94..4a83ef9b 100644
+--- a/lib/components/canvas/image/png_editor_image.dart
++++ b/lib/components/canvas/image/png_editor_image.dart
+@@ -35,6 +35,8 @@ class PngEditorImage extends EditorImage {
+     this.maxSize,
+     super.invertible,
+     super.forceInvert,
++    super.rotationDegrees,
++    super.flipHorizontal,
+     super.backgroundFit,
+     required super.onMoveImage,
+     required super.onDeleteImage,
+@@ -92,6 +94,8 @@ class PngEditorImage extends EditorImage {
+       pageSize: .infinite,
+       invertible: json['v'] ?? true,
+       forceInvert: json['fi'] ?? false,
++      rotationDegrees: (json['r'] as num?)?.toDouble() ?? 0,
++      flipHorizontal: json['fh'] ?? false,
+       backgroundFit: json['f'] != null ? .values[json['f']] : .contain,
+       onMoveImage: null,
+       onDeleteImage: null,
+@@ -229,6 +233,8 @@ class PngEditorImage extends EditorImage {
+     pageSize: .infinite,
+     invertible: invertible,
+     forceInvert: forceInvert,
++    rotationDegrees: rotationDegrees,
++    flipHorizontal: flipHorizontal,
+     backgroundFit: backgroundFit,
+     onMoveImage: onMoveImage,
+     onDeleteImage: onDeleteImage,
+@@ -241,5 +247,6 @@ class PngEditorImage extends EditorImage {
+     thumbnailBytes: thumbnailBytes,
+     isThumbnail: isThumbnail,
+   )..onCropImage = onCropImage
+-      ..onImageAction = onImageAction;
++      ..onImageAction = onImageAction
++      ..onOrientationChange = onOrientationChange;
+ }
+diff --git a/lib/components/canvas/image/svg_editor_image.dart b/lib/components/canvas/image/svg_editor_image.dart
+index 5164af82..387be5bc 100644
+--- a/lib/components/canvas/image/svg_editor_image.dart
++++ b/lib/components/canvas/image/svg_editor_image.dart
+@@ -18,6 +18,8 @@ class SvgEditorImage extends EditorImage {
+     required super.pageSize,
+     super.invertible,
+     super.forceInvert,
++    super.rotationDegrees,
++    super.flipHorizontal,
+     super.backgroundFit,
+     required super.onMoveImage,
+     required super.onDeleteImage,
+@@ -80,6 +82,8 @@ class SvgEditorImage extends EditorImage {
+       pageSize: .infinite,
+       invertible: json['v'] ?? true,
+       forceInvert: json['fi'] ?? false,
++      rotationDegrees: (json['r'] as num?)?.toDouble() ?? 0,
++      flipHorizontal: json['fh'] ?? false,
+       backgroundFit: json['f'] != null ? .values[json['f']] : .contain,
+       onMoveImage: null,
+       onDeleteImage: null,
+@@ -201,6 +205,8 @@ class SvgEditorImage extends EditorImage {
+       pageSize: .infinite,
+       invertible: invertible,
+       forceInvert: forceInvert,
++      rotationDegrees: rotationDegrees,
++      flipHorizontal: flipHorizontal,
+       backgroundFit: backgroundFit,
+       onMoveImage: onMoveImage,
+       onDeleteImage: onDeleteImage,
+@@ -212,6 +218,7 @@ class SvgEditorImage extends EditorImage {
+       naturalSize: naturalSize,
+       isThumbnail: isThumbnail,
+     )..onCropImage = onCropImage
+-      ..onImageAction = onImageAction;
++      ..onImageAction = onImageAction
++      ..onOrientationChange = onOrientationChange;
+   }
+ }
+diff --git a/lib/data/editor/editor_history.dart b/lib/data/editor/editor_history.dart
+index 1e10658f..2ebb2794 100644
+--- a/lib/data/editor/editor_history.dart
++++ b/lib/data/editor/editor_history.dart
+@@ -151,6 +151,7 @@ class EditorHistoryItem {
+     this.backgroundPatternChange,
+     this.srcRectChange,
+     this.imageOrderChange,
++    this.orientationChange,
+   }) : assert(
+          type != .move || offset != null,
+          'Offset must be provided for move',
+@@ -186,6 +187,10 @@ class EditorHistoryItem {
+        assert(
+          type != .reorderImage || imageOrderChange != null,
+          'imageOrderChange must be provided for reorderImage',
++       ),
++       assert(
++         type != .changeOrientation || orientationChange != null,
++         'orientationChange must be provided for changeOrientation',
+        );
+ 
+   final EditorHistoryItemType type;
+@@ -206,6 +211,9 @@ class EditorHistoryItem {
+   /// 渲染顺序就是列表顺序，所以"置顶/置底"就是改下标。
+   final Change<int>? imageOrderChange;
+ 
++  /// 个人自用版：旋转 / 水平翻转的前后值。
++  final Change<ImageOrientation>? orientationChange;
++
+   EditorHistoryItem copyWith({
+     EditorHistoryItemType? type,
+     int? pageIndex,
+@@ -218,6 +226,7 @@ class EditorHistoryItem {
+     Change<CanvasBackgroundPattern>? backgroundPatternChange,
+     Map<EditorImage, Change<Rect>>? srcRectChange,
+     Change<int>? imageOrderChange,
++    Change<ImageOrientation>? orientationChange,
+   }) {
+     return EditorHistoryItem(
+       type: type ?? this.type,
+@@ -232,6 +241,7 @@ class EditorHistoryItem {
+           backgroundPatternChange ?? this.backgroundPatternChange,
+       srcRectChange: srcRectChange ?? this.srcRectChange,
+       imageOrderChange: imageOrderChange ?? this.imageOrderChange,
++      orientationChange: orientationChange ?? this.orientationChange,
+     );
+   }
+ }
+@@ -252,4 +262,7 @@ enum EditorHistoryItemType {
+ 
+   /// 个人自用版：图片置顶/置底
+   reorderImage,
++
++  /// 个人自用版：图片旋转/翻转
++  changeOrientation,
+ }
+diff --git a/lib/pages/editor/editor.dart b/lib/pages/editor/editor.dart
+index 93ea0906..8ff66b6c 100644
+--- a/lib/pages/editor/editor.dart
++++ b/lib/pages/editor/editor.dart
+@@ -233,6 +233,7 @@ class EditorState extends State<Editor> {
+           image.onMiscChange = autosaveAfterDelay;
+           image.onCropImage = onCropImage;
+           image.onImageAction = onImageAction;
++          image.onOrientationChange = onOrientationChange;
+         }
+       }
+     }
+@@ -455,6 +456,12 @@ class EditorState extends State<Editor> {
+               item.imageOrderChange!.previous,
+             );
+           }
++
++        case .changeOrientation:
++          // 个人自用版：撤销旋转/翻转
++          for (final image in item.images) {
++            image.orientation = item.orientationChange!.previous;
++          }
+       }
+ 
+       if (item.type != .move) {
+@@ -518,9 +525,14 @@ class EditorState extends State<Editor> {
+         );
+       case .reorderImage:
+         // 个人自用版：重做置顶/置底
++        undo(
++          item.copyWith(imageOrderChange: item.imageOrderChange!.reverse()),
++        );
++      case .changeOrientation:
++        // 个人自用版：重做旋转/翻转
+         undo(
+           item.copyWith(
+-            imageOrderChange: item.imageOrderChange!.reverse(),
++            orientationChange: item.orientationChange!.reverse(),
+           ),
+         );
+     }
+@@ -896,6 +908,28 @@ class EditorState extends State<Editor> {
+     autosaveAfterDelay();
+   }
+ 
++  /// 个人自用版：记录一次旋转/翻转，用于撤销。
++  void onOrientationChange(
++    EditorImage image,
++    ImageOrientation previous,
++    ImageOrientation current,
++  ) {
++    if (previous == current) return;
++
++    history.recordChange(
++      EditorHistoryItem(
++        type: .changeOrientation,
++        pageIndex: image.pageIndex,
++        strokes: [],
++        images: [image],
++        orientationChange: Change(previous: previous, current: current),
++      ),
++    );
++    // setState to update undo button
++    setState(() {});
++    autosaveAfterDelay();
++  }
++
+   /// 个人自用版：动作条上的复制 / 置顶 / 置底。
+   void onImageAction(EditorImage image, EditorImageAction action) {
+     switch (action) {
+@@ -1226,6 +1260,7 @@ class EditorState extends State<Editor> {
+     for (final image in images) {
+       image.onCropImage = onCropImage;
+       image.onImageAction = onImageAction;
++      image.onOrientationChange = onOrientationChange;
+     }
+ 
+     history.recordChange(
+diff --git a/test/image_orientation_test.dart b/test/image_orientation_test.dart
+new file mode 100644
+index 00000000..48340edc
+--- /dev/null
++++ b/test/image_orientation_test.dart
+@@ -0,0 +1,127 @@
++import 'dart:typed_data';
++
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:saber/components/canvas/_asset_cache.dart';
++import 'package:saber/components/canvas/canvas_image.dart';
++import 'package:saber/components/canvas/image/editor_image.dart';
++
++/// 个人自用版：图片"方向"（自由旋转 + 水平翻转）的验证。
++///
++/// 两件最容易静默失效的事：
++/// 1. 新字段存了没读回来（所以做 toJson → fromJson 往返）
++/// 2. 旋转角度的吸附规则（否则手动几乎转不回正，或者反过来吸得太多、
++///    自由旋转变得不自由）
++void main() {
++  group('normaliseRotationDegrees', () {
++    test('free angles are kept as they are', () {
++      expect(CanvasImage.normaliseRotationDegrees(37), 37);
++      expect(CanvasImage.normaliseRotationDegrees(-42.5), -42.5);
++    });
++
++    test('angles close to a quarter turn snap to it', () {
++      expect(CanvasImage.normaliseRotationDegrees(2), 0);
++      expect(CanvasImage.normaliseRotationDegrees(-3), 0);
++      expect(CanvasImage.normaliseRotationDegrees(88), 90);
++      expect(CanvasImage.normaliseRotationDegrees(-92), -90);
++      expect(CanvasImage.normaliseRotationDegrees(183), 180);
++    });
++
++    test('angles further than 5 degrees away do not snap', () {
++      // 这正是"自由旋转"要保住的部分：只有接近时才吸附
++      expect(CanvasImage.normaliseRotationDegrees(6), 6);
++      expect(CanvasImage.normaliseRotationDegrees(84), 84);
++      expect(CanvasImage.normaliseRotationDegrees(-6), -6);
++    });
++
++    test('wraps into (-180, 180]', () {
++      expect(CanvasImage.normaliseRotationDegrees(370), 10);
++      expect(CanvasImage.normaliseRotationDegrees(-370), -10);
++      expect(CanvasImage.normaliseRotationDegrees(540), 180);
++    });
++  });
++
++  group('orientation persistence', () {
++    final bytes = Uint8List.fromList([1, 2, 3, 4]);
++
++    PngEditorImage image({
++      double rotationDegrees = 0,
++      bool flipHorizontal = false,
++    }) => PngEditorImage(
++      id: 1,
++      assetCache: AssetCache(),
++      extension: '.png',
++      imageProvider: MemoryImage(bytes),
++      pageIndex: 0,
++      pageSize: .infinite,
++      onMoveImage: null,
++      onDeleteImage: null,
++      onMiscChange: null,
++      rotationDegrees: rotationDegrees,
++      flipHorizontal: flipHorizontal,
++    );
++
++    EditorImage reload(Map<String, dynamic> json) => EditorImage.fromJson(
++      json,
++      inlineAssets: [bytes],
++      sbnPath: '/Notes/Test',
++      assetCache: AssetCache(),
++    );
++
++    test('defaults are not written to the note', () {
++      final json = image().toJson(OrderedAssetCache());
++      expect(json.containsKey('r'), isFalse);
++      expect(json.containsKey('fh'), isFalse);
++    });
++
++    test('rotation and flip survive a save/load round trip', () {
++      final json = image(
++        rotationDegrees: 37.5,
++        flipHorizontal: true,
++      ).toJson(OrderedAssetCache());
++      expect(json['r'], 37.5);
++      expect(json['fh'], isTrue);
++
++      final reloaded = reload(json);
++      expect(reloaded.rotationDegrees, 37.5);
++      expect(reloaded.flipHorizontal, isTrue);
++    });
++
++    test('a note without the fields loads as unrotated and unflipped', () {
++      final reloaded = reload(image().toJson(OrderedAssetCache()));
++      expect(reloaded.rotationDegrees, 0);
++      expect(reloaded.flipHorizontal, isFalse);
++      expect(reloaded.hasOrientationAdjustments, isFalse);
++    });
++  });
++
++  group('the orientation getter and setter', () {
++    test('round trip, and drive hasOrientationAdjustments', () {
++      final image = PngEditorImage(
++        id: 1,
++        assetCache: AssetCache(),
++        extension: '.png',
++        imageProvider: MemoryImage(Uint8List.fromList([1])),
++        pageIndex: 0,
++        pageSize: .infinite,
++        onMoveImage: null,
++        onDeleteImage: null,
++        onMiscChange: null,
++      );
++
++      expect(image.hasOrientationAdjustments, isFalse);
++
++      image.orientation = (rotationDegrees: 12, flipHorizontal: true);
++      expect(image.rotationDegrees, 12);
++      expect(image.flipHorizontal, isTrue);
++      expect(image.hasOrientationAdjustments, isTrue);
++
++      // 只翻转也算"调整过"
++      image.orientation = (rotationDegrees: 0, flipHorizontal: true);
++      expect(image.hasOrientationAdjustments, isTrue);
++
++      image.orientation = (rotationDegrees: 0, flipHorizontal: false);
++      expect(image.hasOrientationAdjustments, isFalse);
++    });
++  });
++}

@@ -1,0 +1,810 @@
+From fed83adb1b7fc61cd45c8ede1abc176bfa692a3f Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 21:03:13 +0800
+Subject: [PATCH 14/14] =?UTF-8?q?=E7=AC=AC=E5=8D=81=E6=89=B9=EF=BC=9A?=
+ =?UTF-8?q?=E6=97=8B=E8=BD=AC=E6=89=8B=E6=84=9F=EF=BC=88=E7=AE=AD=E5=A4=B4?=
+ =?UTF-8?q?=E8=B7=9F=E6=89=8B=20+=20=E4=B8=8D=E5=86=8D=E8=A3=81=E8=BE=B9?=
+ =?UTF-8?q?=20+=20=E5=8A=A8=E4=BD=9C=E6=9D=A1=E4=B8=8D=E8=B7=B3=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+用户反馈"绕中心一起转但还是不对，手感太奇怪"。查代码定位到四个具体毛病：
+
+1. 旋转箭头的位置只由 frameWidth 算、与角度无关，一直粘在外层格子的上边缘。
+   竖图转到 90° 时它在 (-50,-172)，而"图片上边缘中点"应该在 (+222,0)，差 322px
+   —— 手指一拖箭头就从手指底下溜走。改为按 rotateHandleOffset 走轨道，圆心
+   永远贴在图片上边缘中点（0° 时位置与改动前逐像素相同，golden 全部照旧）。
+2. 外层格子 = 旋转外接矩形 + 2*pad，90° 时比把手框还矮，Center 下发的宽松约束
+   把 SizedBox 夹回去（RenderConstrainedBox 的 enforce），把手框内部默认
+   Clip.hardEdge 的 Stack 于是把图片和边框裁掉一条边。新增 interactionBoxSize：
+   取 max(旋转外接矩形, 未旋转把手框)，保证永远压不扁。
+3. 动作条 top 依赖 boundsHeight，旋转时上下跳（45° 时比 0° 低 113px）。改为只跟
+   未旋转的把手框有关、与角度无关；格子按 bottomSpace 对称加高，图片中心仍是
+   格子中心（旋转轴不动）。顺带：动作条可用宽度原本 = 格子宽度，窄图上两端的
+   按钮点不到（第七批记的已知限制），现在显示动作条时格子宽度至少取一个页面宽。
+4. 指针几乎压在图片中心上时 atan2 是噪声（atan2(0,0) 给 0）会把图甩飞，加 8px
+   死区；吸附到 90 的整数倍时给一下轻触反馈（HapticFeedback.selectionClick）。
+   裁剪交互层的位置改为按 frameOrigin 推导（格子不再恒等于"把手框 + 2*pad"，
+   否则会整体偏一个动作条的高度）。
+
+测试：
+- test/image_orientation_test.dart +13 个纯几何用例（轨道位置、半径不变、
+  "箭头始终在手指射线上"、格子任一角度都不小于把手框、动作条与箭头都装得进格子）
+- 新增 test/image_rotate_drag_test.dart（5 个端到端 widget 测试：真挂载
+  CanvasImage、真发指针事件拖箭头）：
+  转 90° 后箭头仍在手指底下、把手框没被夹扁、动作条上下位置与高度不变、
+  手指穿过图片中心时角度不动、点「裁剪」后裁剪层仍正对图片。
+  其中"跟手"和"没被夹扁"两条在改动前必然失败。
+
+flutter analyze 无问题；299 通过 / 12 跳过 / 3 个既存环境失败；全部 golden 通过。
+APK：dist/Saber-arm64-v1.36.1.apk，SHA-256 38d080a6…（arm64-v8a 单 ABI）。
+---
+ lib/components/canvas/canvas_image.dart | 177 +++++++++++++++----
+ test/image_orientation_test.dart        | 205 ++++++++++++++++++++++
+ test/image_rotate_drag_test.dart        | 223 ++++++++++++++++++++++++
+ 3 files changed, 571 insertions(+), 34 deletions(-)
+ create mode 100644 test/image_rotate_drag_test.dart
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index 8003404c..e53ca783 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -2,6 +2,7 @@ import 'dart:math';
+ 
+ import 'package:defer_pointer/defer_pointer.dart';
+ import 'package:flutter/material.dart';
++import 'package:flutter/services.dart';
+ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:saber/components/canvas/canvas_image_dialog.dart';
+ import 'package:saber/components/canvas/cropped_image.dart';
+@@ -121,6 +122,57 @@ class CanvasImage extends StatefulHookWidget {
+     );
+   }
+ 
++  /// 个人自用版：动作条的高度。
++  ///
++  /// 图标按钮是紧约束 38×38（`_button`），外面 Material 还有 2 的上下内边距。
++  /// 外层格子要按它留出空间，动作条才不会被格子边界卡成"看得见点不到"。
++  static const actionBarHeight = 42.0;
++
++  /// 个人自用版：旋转箭头圆心相对**图片中心**的位置。
++  ///
++  /// 箭头永远贴在"图片上边缘的中点"上（半径 = 把手框高度的一半，也就是离图片
++  /// 边缘 22px），所以图片转的时候它跟着一起转 —— 拖它的手指停在原地，箭头也
++  /// 停在手指底下，这才是"直接操控"的手感。
++  ///
++  /// 改动前它粘在格子上边缘、位置与角度无关，图一转它就跑到别的地方去了
++  /// （竖图 300×400 转到 90° 时它在 (-50,-172)，而应该在 (+222,0)，差 322px），
++  /// 所以怎么拖都觉得别扭。
++  @visibleForTesting
++  static Offset rotateHandleOffset(Size frameSize, double degrees) {
++    final double radians = degrees * pi / 180;
++    final double radius = frameSize.height / 2;
++    // 正上方为 0、顺时针为正，与 Transform.rotate / _angleFromImageCentre 一致
++    return Offset(radius * sin(radians), -radius * cos(radians));
++  }
++
++  /// 个人自用版：外层交互格子的尺寸。两条硬约束：
++  ///
++  /// ① **任何角度都不能比未旋转的把手框小**。格子 = 旋转外接矩形 + 2*padding，
++  ///    而 90°/270° 时外接矩形在某一轴上会比把手框本身还小；这时
++  ///    `Positioned.fill > Center` 下发的宽松约束会把 `SizedBox` 夹回去
++  ///    （`RenderConstrainedBox.performLayout` 里的 `enforce`），把手框被压扁，
++  ///    它内部默认 `Clip.hardEdge` 的 Stack 就把图片和边框裁掉一条边
++  ///    （竖图 300×400 转到 90° 会少 22px）。所以取 `max(外接矩形, 把手框)`。
++  ///
++  /// ② 高度要多出 `2 * bottomSpace`：格子是**以图片中心为中心**对称长大的，
++  ///    多出来的空间上下各一半，动作条的位置才能与角度无关（不再随旋转上下跳）。
++  ///    宽度至少 `minWidth`（显示动作条时给页面宽度），窄图上动作条两端的
++  ///    按钮才在可命中的范围里。
++  @visibleForTesting
++  static Size interactionBoxSize({
++    required Size frameSize,
++    required double degrees,
++    required double padding,
++    double bottomSpace = 0,
++    double minWidth = 0,
++  }) {
++    final Size bounds = rotatedBounds(frameSize, degrees);
++    return Size(
++      max(max(bounds.width, frameSize.width), minWidth) + padding * 2,
++      max(bounds.height, frameSize.height) + padding * 2 + bottomSpace * 2,
++    );
++  }
++
+   /// 个人自用版：当前是否有图片处于裁剪模式。
+   ///
+   /// 画布（InnerCanvas）监听它，在裁剪时铺一层透明的"点空白处完成裁剪"捕获层。
+@@ -283,9 +335,14 @@ class _CanvasImageState extends State<CanvasImage> {
+   double? _rotatePointerStartDegrees;
+   double? _rotateImageStartDegrees;
+ 
++  /// 个人自用版：上一次"吸附到直角"时给的触感反馈对应哪个角度。
++  /// 只在吸附值发生变化的那一帧震一下，不是每帧都震。
++  double? _lastSnapTickDegrees;
++
+   void startRotate(Offset globalPosition) {
+     _rotatePointerStartDegrees = _angleFromImageCentre(globalPosition);
+     _rotateImageStartDegrees = widget.image.rotationDegrees;
++    _lastSnapTickDegrees = null;
+   }
+ 
+   void updateRotate(Offset globalPosition) {
+@@ -293,18 +350,37 @@ class _CanvasImageState extends State<CanvasImage> {
+     final imageStart = _rotateImageStartDegrees;
+     if (pointerStart == null || imageStart == null) return;
+ 
+-    final delta = _angleFromImageCentre(globalPosition) - pointerStart;
++    // 手指几乎压在图片中心上时角度噪声极大（atan2(0,0) 会直接给 0），
++    // 会让图突然甩到某个角度；这种情况直接忽略这一帧。
++    final double? pointerNow = _angleFromImageCentre(
++      globalPosition,
++      deadZone: _rotateDeadZone,
++    );
++    if (pointerNow == null) return;
++
++    final double newDegrees = CanvasImage.normaliseRotationDegrees(
++      imageStart + (pointerNow - pointerStart),
++    );
+     setState(() {
+-      widget.image.rotationDegrees = CanvasImage.normaliseRotationDegrees(
+-        imageStart + delta,
+-      );
++      widget.image.rotationDegrees = newDegrees;
+     });
++
++    // 吸附到 90 的整数倍时给一下轻触反馈（"咔"一下），手感上才知道吸住了
++    if (newDegrees % 90 == 0) {
++      if (_lastSnapTickDegrees != newDegrees) {
++        _lastSnapTickDegrees = newDegrees;
++        HapticFeedback.selectionClick();
++      }
++    } else {
++      _lastSnapTickDegrees = null;
++    }
+   }
+ 
+   void endRotate() {
+     final imageStart = _rotateImageStartDegrees;
+     _rotatePointerStartDegrees = null;
+     _rotateImageStartDegrees = null;
++    _lastSnapTickDegrees = null;
+     if (imageStart == null) return;
+     if (imageStart == widget.image.rotationDegrees) return;
+ 
+@@ -318,12 +394,18 @@ class _CanvasImageState extends State<CanvasImage> {
+     );
+   }
+ 
++  /// 个人自用版：指针离图片中心多近算"太近"（像素）。见 [updateRotate]。
++  static const _rotateDeadZone = 8.0;
++
+   /// 指针相对图片中心的角度（度，顺时针为正，正上方为 0）。
+-  double _angleFromImageCentre(Offset globalPosition) {
++  ///
++  /// 指针落在中心 [deadZone] 像素内时返回 `null`：那里角度是噪声，不是意图。
++  double? _angleFromImageCentre(Offset globalPosition, {double deadZone = 0}) {
+     final box = context.findRenderObject() as RenderBox?;
+     if (box == null || !box.hasSize) return 0;
+     final centre = box.size.center(Offset.zero);
+     final vector = box.globalToLocal(globalPosition) - centre;
++    if (deadZone > 0 && vector.distance < deadZone) return null;
+     // 旋转箭头在正上方，所以 0 度对应"指针在中心正上方"
+     return atan2(vector.dx, -vector.dy) * 180 / pi;
+   }
+@@ -557,15 +639,30 @@ class _CanvasImageState extends State<CanvasImage> {
+     // 裁剪模式下不旋转：裁剪框永远在未旋转的源图坐标系里
+     final double degrees = _cropping ? 0 : widget.image.rotationDegrees;
+     final double radians = degrees * pi / 180;
+-    // 旋转后的外接矩形：格子跟着它变大，图片本身（frameWidth/Height）不缩放
+-    final Size bounds = CanvasImage.rotatedBounds(
+-      Size(frameWidth, frameHeight),
+-      degrees,
++
++    final Size frameSize = Size(frameWidth, frameHeight);
++    // 动作条只在"选中且可编辑"时出现；它出现时格子要多留出它的高度和宽度
++    final bool showActionBar =
++        active && !widget.readOnly && !widget.isBackground;
++    // 格子的尺寸：见 interactionBoxSize 的注释（不能被压扁 / 要装得下动作条）
++    final Size box = CanvasImage.interactionBoxSize(
++      frameSize: frameSize,
++      degrees: degrees,
++      padding: pad,
++      bottomSpace: showActionBar ? CanvasImage.actionBarHeight + 8 : 0,
++      minWidth: showActionBar ? widget.pageSize.width : 0,
++    );
++    final Offset boxCentre = Offset(box.width / 2, box.height / 2);
++    // 把手框在格子里的左上角。格子不再恒等于"把手框 + 2*pad"（旋转外接矩形
++    // 会更大、动作条会额外撑高、宽度可能撑到页面宽度），所以不能写死 inset。
++    final Offset frameOrigin = Offset(
++      (box.width - frameWidth) / 2,
++      (box.height - frameHeight) / 2,
+     );
+-    final double boundsWidth = bounds.width;
+-    final double boundsHeight = bounds.height;
+ 
+     final Widget handleFrame = SizedBox(
++      // 个人自用版：给测试用的稳定锚点（验证它没被外层格子夹扁）
++      key: const ValueKey('imageHandleFrame'),
+       width: frameWidth,
+       height: frameHeight,
+       child: Stack(
+@@ -609,11 +706,11 @@ class _CanvasImageState extends State<CanvasImage> {
+         ),
+ 
+         // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）。
+-        // 裁剪时 degrees 恒为 0，所以按"图片 + pad"摆放就能和图片对齐。
++        // 裁剪时 degrees 恒为 0，所以它和图片一样摆在"把手框位置 + inset"处。
+         if (_cropping)
+           Positioned(
+-            left: inset,
+-            top: inset,
++            left: frameOrigin.dx + inset - pad,
++            top: frameOrigin.dy + inset - pad,
+             width: boxWidth + pad * 2,
+             height: boxHeight + pad * 2,
+             child: ImageCropOverlay(
+@@ -625,23 +722,29 @@ class _CanvasImageState extends State<CanvasImage> {
+             ),
+           ),
+ 
+-        // 个人自用版：图片上方的旋转箭头（不跟着图片转，永远在正上方）
++        // 个人自用版：图片上边缘中点上的旋转箭头。
++        // 位置跟着角度走（rotateHandleOffset）→ 它随图片一起绕中心转，
++        // 拖动时它就一直待在手指底下。
+         if (showResizeHandles)
+           _CanvasImageRotateHandle(
+             active: active,
+             image: widget.image,
+-            frameWidth: frameWidth,
++            // 圆心 = 格子中心 + "图片上边缘中点"随角度转过去的位置
++            centre:
++                boxCentre + CanvasImage.rotateHandleOffset(frameSize, degrees),
+             onRotateStart: startRotate,
+             onRotateUpdate: updateRotate,
+             onRotateEnd: endRotate,
+           ),
+ 
+-        // 个人自用版：选中时在图片**下方**浮出动作条
+-        if (active && !widget.readOnly && !widget.isBackground)
++        // 个人自用版：选中时在图片**下方**浮出动作条。
++        // 位置只跟"未旋转的把手框"有关，与角度无关 —— 旋转时它不会上下跳。
++        // （格子中心 = 图片中心，所以这个式子的全局位置和改动前 0° 时完全一样。）
++        if (showActionBar)
+           Positioned(
+             left: 0,
+             right: 0,
+-            top: pad + boundsHeight + 8,
++            top: boxCentre.dy + frameHeight / 2 + 8,
+             child: DeferPointer(
+               paintOnTop: true,
+               child: Center(
+@@ -694,12 +797,15 @@ class _CanvasImageState extends State<CanvasImage> {
+           : const Duration(milliseconds: 300),
+       curve: Curves.fastLinearToSlowEaseIn,
+ 
+-      // 外层格子 = 旋转后的外接矩形 + pad，并且**以图片中心为中心**，
+-      // 这样旋转时格子会对称地长大/缩小，图片本身的位置和大小都不动
+-      left: widget.image.dstRect.center.dx - (boundsWidth + pad * 2) / 2,
+-      top: widget.image.dstRect.center.dy - (boundsHeight + pad * 2) / 2,
+-      width: boundsWidth + pad * 2,
+-      height: boundsHeight + pad * 2,
++      // 外层格子**以图片中心为中心**（对称），这样：
++      // ① 旋转时图片本身的位置和大小都不动（格子只是对称地长大/缩小）；
++      // ② 旋转轴 = 格子中心 = _angleFromImageCentre 的原点，三处一致；
++      // ③ AnimatedPositioned 动画期间中心也不变（left 与 width 同步线性变化），
++      //    所以格子长大的那 300ms 里动作条和旋转箭头也不会漂。
++      left: widget.image.dstRect.center.dx - box.width / 2,
++      top: widget.image.dstRect.center.dy - box.height / 2,
++      width: box.width,
++      height: box.height,
+ 
+       child: withActionBar,
+     );
+@@ -947,6 +1053,8 @@ class _CanvasImageActionBar extends StatelessWidget {
+   Widget build(BuildContext context) {
+     final colorScheme = ColorScheme.of(context);
+     return Material(
++      // 个人自用版：给测试用的稳定锚点（取它的位置验证"旋转时动作条不动"）
++      key: const ValueKey('imageActionBar'),
+       color: colorScheme.surfaceContainerHighest,
+       elevation: 3,
+       borderRadius: const .all(.circular(24)),
+@@ -1046,18 +1154,20 @@ class _CanvasImageActionBar extends StatelessWidget {
+   }
+ }
+ 
+-/// 个人自用版：图片正上方的旋转箭头，拖动即可自由旋转。
++/// 个人自用版：图片上边缘中点上的旋转箭头，拖动即可自由旋转。
+ ///
+ /// 它占的位置原本是"顶部中间那个缩放把手"（两者会重叠），所以那个把手
+ /// 撤掉了 —— 顶部仍然可以用两个上角拉伸。
+ ///
+-/// 位置：圆心正好压在图片上边缘，靠 [CanvasImage.handlePadding] 那一圈
+-/// 提供的可命中区域，所以整圆都点得到（见第六批修的那个 bug）。
++/// 位置由调用方按 [CanvasImage.rotateHandleOffset] 算好传进来（格子内坐标），
++/// 所以它**跟着图片绕中心转**：拖它的手指不动，它也不会从手指底下溜走。
++/// 整个圆的 44×44 都在格子里，而且外面裹了 [DeferPointer]（命中测试绕开父级
++/// 边界），所以整圆都点得到（见第六批修的那个 bug）。
+ class _CanvasImageRotateHandle extends StatelessWidget {
+   const new({
+     required this.active,
+     required this.image,
+-    required this.frameWidth,
++    required this.centre,
+     required this.onRotateStart,
+     required this.onRotateUpdate,
+     required this.onRotateEnd,
+@@ -1066,8 +1176,8 @@ class _CanvasImageRotateHandle extends StatelessWidget {
+   final bool active;
+   final EditorImage image;
+ 
+-  /// 把手框的宽度（图片 + 两圈 handleInset）。
+-  final double frameWidth;
++  /// 圆心在**格子**坐标系里的位置。
++  final Offset centre;
+   final void Function(Offset globalPosition) onRotateStart;
+   final void Function(Offset globalPosition) onRotateUpdate;
+   final VoidCallback onRotateEnd;
+@@ -1077,9 +1187,8 @@ class _CanvasImageRotateHandle extends StatelessWidget {
+     final colorScheme = ColorScheme.of(context);
+     const double size = CanvasImage.handleSize;
+     return Positioned(
+-      // 压在"把手框"的上边缘（也就是图片上方 handleInset 处）水平居中
+-      left: CanvasImage.handlePadding + frameWidth / 2 - size / 2,
+-      top: CanvasImage.handlePadding - size / 2,
++      left: centre.dx - size / 2,
++      top: centre.dy - size / 2,
+       child: DeferPointer(
+         paintOnTop: true,
+         child: MouseRegion(
+diff --git a/test/image_orientation_test.dart b/test/image_orientation_test.dart
+index b7ba0f7c..1f1b4573 100644
+--- a/test/image_orientation_test.dart
++++ b/test/image_orientation_test.dart
+@@ -1,3 +1,4 @@
++import 'dart:math';
+ import 'dart:typed_data';
+ 
+ import 'package:flutter/material.dart';
+@@ -88,6 +89,210 @@ void main() {
+     });
+   });
+ 
++  group('rotateHandleOffset', () {
++    // 竖图：dstRect 300×400 → 把手框 344×444（图片 + 两圈 handleInset）
++    const frame = Size(344, 444);
++    final halfHeight = frame.height / 2;
++
++    /// 从"图片中心"指向 [offset] 的方向角（度，正上方 0、顺时针为正），
++    /// 与 `_angleFromImageCentre` 用的是同一套约定。
++    double directionOf(Offset offset) => atan2(offset.dx, -offset.dy) * 180 / pi;
++
++    /// 两个方向角之间的夹角（度，0~180）。
++    double angleGap(double a, double b) {
++      var gap = (a - b) % 360;
++      if (gap > 180) gap -= 360;
++      if (gap <= -180) gap += 360;
++      return gap.abs();
++    }
++
++    test('0 degrees hugs the top edge (same place as before the change)', () {
++      final offset = CanvasImage.rotateHandleOffset(frame, 0);
++      expect(offset.dx, closeTo(0, 0.001));
++      expect(offset.dy, closeTo(-halfHeight, 0.001));
++    });
++
++    test('a quarter turn moves it to the right edge', () {
++      final offset = CanvasImage.rotateHandleOffset(frame, 90);
++      expect(offset.dx, closeTo(halfHeight, 0.001));
++      expect(offset.dy, closeTo(0, 0.001));
++    });
++
++    test('counter-clockwise goes to the left edge', () {
++      final offset = CanvasImage.rotateHandleOffset(frame, -90);
++      expect(offset.dx, closeTo(-halfHeight, 0.001));
++      expect(offset.dy, closeTo(0, 0.001));
++    });
++
++    test('a half turn moves it to the bottom edge', () {
++      final offset = CanvasImage.rotateHandleOffset(frame, 180);
++      expect(offset.dx, closeTo(0, 0.000001));
++      expect(offset.dy, closeTo(halfHeight, 0.001));
++    });
++
++    test('it always keeps the same distance from the centre', () {
++      for (final degrees in <double>[0, 17, 45, 90, 137, 180, -90, -175]) {
++        final offset = CanvasImage.rotateHandleOffset(frame, degrees);
++        expect(
++          offset.distance,
++          closeTo(halfHeight, 0.001),
++          reason: '$degrees degrees',
++        );
++      }
++    });
++
++    test('it stays on the finger\'s ray while dragging', () {
++      // 这就是这批要修的性质：拖箭头时它必须停在手指底下。
++      // 用户是抓着箭头按下去的，所以"指针起始角"= 图片起始角度下箭头自己的方向；
++      // 指针转到 A 之后，箭头的方向必须还是 A（吸附时最多偏 5 度，那是刻意的）。
++      for (final imageStart in <double>[0, 37, 90, -120, 180]) {
++        final pointerStart = directionOf(
++          CanvasImage.rotateHandleOffset(frame, imageStart),
++        );
++        for (final delta in <double>[40, 90, -35, 179]) {
++          final pointerNow = pointerStart + delta;
++          final newDegrees = CanvasImage.normaliseRotationDegrees(
++            imageStart + (pointerNow - pointerStart),
++          );
++          final handleDirection = directionOf(
++            CanvasImage.rotateHandleOffset(frame, newDegrees),
++          );
++          final snapped = newDegrees % 90 == 0;
++          expect(
++            angleGap(handleDirection, pointerNow),
++            lessThanOrEqualTo(snapped ? 5.001 : 0.000001),
++            reason: 'start $imageStart, pointer $pointerNow → $newDegrees',
++          );
++        }
++      }
++    });
++
++    test('it is no longer anchored to the bounding box', () {
++      // 改动前它的位置只由 frameWidth 算、与角度无关：竖图转到 90° 时它在
++      // ((frameW - frameH) / 2, -frameW / 2)，即"旋转后外接矩形的上边缘"，
++      // 而"图片上边缘中点"这时应该在右边 → 两者差 300+ px，这就是手感乱的根源。
++      final oldOffset90 = Offset(
++        (frame.width - frame.height) / 2,
++        -frame.width / 2,
++      );
++      final newOffset90 = CanvasImage.rotateHandleOffset(frame, 90);
++      expect(newOffset90.dx, closeTo(halfHeight, 0.001));
++      expect(newOffset90.dy, closeTo(0, 0.001));
++      expect((newOffset90 - oldOffset90).distance, greaterThan(200));
++    });
++  });
++
++  group('interactionBoxSize', () {
++    const padding = 28.0;
++
++    /// 竖图 / 宽图各一个，旋转时外接矩形变小的那一轴不一样。
++    const portrait = Size(344, 444);
++    const landscape = Size(644, 194);
++
++    const angles = <double>[
++      0,
++      3,
++      17,
++      45,
++      60,
++      89,
++      90,
++      137,
++      180,
++      271.5,
++      -90,
++      -158,
++    ];
++
++    Size boxFor(Size frame, double degrees, {double bottomSpace = 0}) =>
++        CanvasImage.interactionBoxSize(
++          frameSize: frame,
++          degrees: degrees,
++          padding: padding,
++          bottomSpace: bottomSpace,
++        );
++
++    test('at 0 degrees it is just the frame plus padding', () {
++      // 这一条保证 0° 时的画面逐像素不变（golden 靠它）
++      expectSize(boxFor(portrait, 0), const Size(344 + 56, 444 + 56));
++      expectSize(boxFor(landscape, 0), const Size(644 + 56, 194 + 56));
++    });
++
++    test('bottomSpace is added symmetrically', () {
++      // 上下各加一半 → 图片中心仍是格子中心 → 旋转轴不动
++      expectSize(boxFor(portrait, 0, bottomSpace: 50), const Size(400, 600));
++    });
++
++    test('minWidth widens the box without touching the height', () {
++      final box = CanvasImage.interactionBoxSize(
++        frameSize: portrait,
++        degrees: 0,
++        padding: padding,
++        minWidth: 1000,
++      );
++      expect(box.width, closeTo(1056, 0.001));
++      expect(box.height, closeTo(500, 0.001));
++    });
++
++    test('the frame is never squeezed, at any angle', () {
++      // 回归：格子比把手框小的时候，Center 下发的宽松约束会把 SizedBox 夹回去
++      //（RenderConstrainedBox 的 enforce），它内部默认 Clip.hardEdge 的 Stack
++      // 就裁掉图片一条边 —— 竖图转到 90° 正好命中这种情况。
++      for (final frame in <Size>[portrait, landscape]) {
++        for (final degrees in angles) {
++          final box = boxFor(frame, degrees);
++          expect(
++            box.width,
++            greaterThanOrEqualTo(frame.width + padding * 2 - 0.001),
++            reason: '$frame @ $degrees',
++          );
++          expect(
++            box.height,
++            greaterThanOrEqualTo(frame.height + padding * 2 - 0.001),
++            reason: '$frame @ $degrees',
++          );
++        }
++      }
++    });
++
++    test('the action bar always fits inside the box', () {
++      // 动作条顶 = 格子中心 + 把手框高/2 + 8；它必须整条落在格子里
++      //（格子边界之外的东西在 Flutter 里点不到）
++      const bottomSpace = CanvasImage.actionBarHeight + 8;
++      for (final frame in <Size>[portrait, landscape]) {
++        for (final degrees in angles) {
++          final box = boxFor(frame, degrees, bottomSpace: bottomSpace);
++          final barTop = box.height / 2 + frame.height / 2 + 8;
++          expect(
++            barTop + CanvasImage.actionBarHeight,
++            lessThanOrEqualTo(box.height + 0.001),
++            reason: '$frame @ $degrees',
++          );
++        }
++      }
++    });
++
++    test('the rotate handle always fits inside the box', () {
++      const half = CanvasImage.handleSize / 2;
++      for (final frame in <Size>[portrait, landscape]) {
++        for (final degrees in angles) {
++          final box = boxFor(frame, degrees);
++          final offset = CanvasImage.rotateHandleOffset(frame, degrees);
++          expect(
++            box.width / 2 + offset.dx.abs() + half,
++            lessThanOrEqualTo(box.width + 0.001),
++            reason: '$frame @ $degrees',
++          );
++          expect(
++            box.height / 2 + offset.dy.abs() + half,
++            lessThanOrEqualTo(box.height + 0.001),
++            reason: '$frame @ $degrees',
++          );
++        }
++      }
++    });
++  });
++
+   group('orientation persistence', () {
+     final bytes = Uint8List.fromList([1, 2, 3, 4]);
+ 
+diff --git a/test/image_rotate_drag_test.dart b/test/image_rotate_drag_test.dart
+new file mode 100644
+index 00000000..63bdff82
+--- /dev/null
++++ b/test/image_rotate_drag_test.dart
+@@ -0,0 +1,223 @@
++import 'package:defer_pointer/defer_pointer.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:image/image.dart' as im;
++import 'package:saber/components/canvas/_asset_cache.dart';
++import 'package:saber/components/canvas/canvas_image.dart';
++import 'package:saber/components/canvas/image/editor_image.dart';
++import 'package:saber/components/canvas/image_crop_overlay.dart';
++
++/// 个人自用版：挂载真的 [CanvasImage] 做的**端到端**测试。
++///
++/// 旋转部分：前两批"手感不对"都出在这一层 —— 位置算对了、但拖动时箭头从手指
++/// 底下溜走。所以这里用真的指针事件拖它，断言：
++///   1. 箭头跟着手指走（转 90° 后它还在手指底下）；
++///   2. 松手后角度存住（并且产生一条可撤销的记录）；
++///   3. 旋转过程中动作条一动不动（不再随外接矩形上下跳）；
++///   4. 90° 时把手框没被外层格子夹扁（第八批"越转越小"的残留）。
++///
++/// 裁剪层对齐：第十批把外层格子的尺寸算法改了（格子不再恒等于"把手框 + 2*pad"），
++/// 裁剪交互层的位置必须跟着改，否则会整体偏一个动作条的高度。这里顺手守住它。
++void main() {
++  const pageSize = Size(1000, 1400);
++  // 竖图：300×400，放在页面中间偏下一点
++  const dstRect = Rect.fromLTWH(350, 500, 300, 400);
++  const naturalSize = Size(300, 400);
++
++  /// 合法的 1×1 PNG，只是让 Image 有东西可解；画面内容不参与断言。
++  final onePixelPng = im.encodePng(im.Image(width: 1, height: 1));
++
++  late PngEditorImage image;
++  late List<double> orientationChanges;
++
++  setUp(() {
++    // 测试里不要留下"5 秒后才 loadOut"的定时器
++    EditorImage.shouldLoadOutImmediately = true;
++    addTearDown(() => EditorImage.shouldLoadOutImmediately = false);
++
++    orientationChanges = [];
++    image = PngEditorImage(
++      id: 1,
++      assetCache: AssetCache(),
++      extension: '.png',
++      imageProvider: MemoryImage(onePixelPng),
++      pageIndex: 0,
++      pageSize: pageSize,
++      onMoveImage: null,
++      onDeleteImage: null,
++      onMiscChange: null,
++      // newImage 让它在挂载时就是 active（旋转箭头才可拖）
++      newImage: true,
++      dstRect: dstRect,
++      srcRect: Offset.zero & naturalSize,
++      naturalSize: naturalSize,
++    );
++    image.onOrientationChange = (img, before, after) =>
++        orientationChanges.add(after.rotationDegrees);
++  });
++
++  Future<void> pumpImage(WidgetTester tester) async {
++    // 让整页都在屏幕内：DeferredPointerHandler 的命中测试受它自己的尺寸限制
++    tester.view.physicalSize = pageSize;
++    tester.view.devicePixelRatio = 1;
++    addTearDown(tester.view.reset);
++
++    await tester.pumpWidget(
++      MaterialApp(
++        home: Align(
++          alignment: Alignment.topLeft,
++          child: SizedBox(
++            width: pageSize.width,
++            height: pageSize.height,
++            child: DeferredPointerHandler(
++              child: Stack(
++                children: [
++                  CanvasImage(
++                    filePath: '/Notes/Test',
++                    image: image,
++                    pageSize: pageSize,
++                    setAsBackground: null,
++                  ),
++                ],
++              ),
++            ),
++          ),
++        ),
++      ),
++    );
++    await tester.pumpAndSettle();
++  }
++
++  testWidgets('the rotate handle starts on the image\'s top edge', (
++    tester,
++  ) async {
++    await pumpImage(tester);
++
++    final handle = find.byKey(const ValueKey('imageRotateHandle'));
++    expect(handle, findsOneWidget);
++
++    final imageCentre = tester.getCenter(find.byType(Image));
++    expect(imageCentre.dx, closeTo(dstRect.center.dx, 0.5));
++    expect(imageCentre.dy, closeTo(dstRect.center.dy, 0.5));
++
++    // 0° 时圆心正好在图片上边缘（也就是"把手框上边缘"）上，水平居中
++    final frameHeight = dstRect.height + CanvasImage.handleInset * 2;
++    final fromCentre = tester.getCenter(handle) - imageCentre;
++    expect(fromCentre.dx.abs(), lessThan(0.5));
++    expect(fromCentre.dy, closeTo(-frameHeight / 2, 0.5));
++  });
++
++  testWidgets('dragging it a quarter turn keeps it under the finger', (
++    tester,
++  ) async {
++    await pumpImage(tester);
++
++    final handle = find.byKey(const ValueKey('imageRotateHandle'));
++    final imageCentre = tester.getCenter(find.byType(Image));
++    final frameHeight = dstRect.height + CanvasImage.handleInset * 2;
++    final radius = frameHeight / 2;
++    final barBefore = tester.getRect(
++      find.byKey(const ValueKey('imageActionBar')),
++    );
++
++    // 先沿半径方向往外挪一点：只为越过 touch slop，角度不变（还是正上方）
++    final gesture = await tester.startGesture(tester.getCenter(handle));
++    await tester.pump();
++    await gesture.moveTo(imageCentre + Offset(0, -(radius + 40)));
++    await tester.pump();
++    // 再绕中心转到正右方（+90°）
++    await gesture.moveTo(imageCentre + Offset(radius, 0));
++    await tester.pump();
++    await gesture.up();
++    await tester.pumpAndSettle();
++
++    expect(image.rotationDegrees, 90);
++
++    // 箭头应该停在"图片中心正右方、半径不变"的地方 —— 也就是手指底下
++    final handleNow = tester.getCenter(handle) - imageCentre;
++    expect(handleNow.dx, closeTo(radius, 1.0));
++    expect(handleNow.dy.abs(), lessThan(1.0));
++
++    // 松手后记一条方向变更（可撤销）
++    expect(orientationChanges, [90]);
++
++    // 动作条在旋转过程中纹丝不动（不再随外接矩形上下跳）。
++    // 只比上下位置和高度：宽度会因为"重置"按钮出现而变宽，那是另一回事。
++    final barAfter = tester.getRect(
++      find.byKey(const ValueKey('imageActionBar')),
++    );
++    expect(barAfter.top, barBefore.top);
++    expect(barAfter.height, barBefore.height);
++  });
++
++  testWidgets('a quarter turn does not squeeze the image', (tester) async {
++    await pumpImage(tester);
++
++    final handle = find.byKey(const ValueKey('imageRotateHandle'));
++    final imageCentre = tester.getCenter(find.byType(Image));
++    final frameHeight = dstRect.height + CanvasImage.handleInset * 2;
++    final radius = frameHeight / 2;
++
++    final gesture = await tester.startGesture(tester.getCenter(handle));
++    await tester.pump();
++    await gesture.moveTo(imageCentre + Offset(0, -(radius + 40)));
++    await tester.pump();
++    await gesture.moveTo(imageCentre + Offset(radius, 0));
++    await tester.pump();
++    await gesture.up();
++    await tester.pumpAndSettle();
++
++    expect(image.rotationDegrees, 90);
++    // 把手框（图片 + 两圈 handleInset）**没有被外层格子夹扁**：
++    // 改动前格子 = 旋转外接矩形 + 2*pad，90° 时它比把手框矮，Center 下发的
++    // 宽松约束会把 SizedBox 夹回去，把手框内部默认 Clip.hardEdge 的 Stack
++    // 于是把图片和边框裁掉一条边（竖图正好少 22px）。
++    expect(
++      tester.getSize(find.byKey(const ValueKey('imageHandleFrame'))),
++      const Size(300 + CanvasImage.handleInset * 2, 400 + CanvasImage.handleInset * 2),
++    );
++  });
++
++  testWidgets('the handle ignores a pointer that sits on the centre', (
++    tester,
++  ) async {
++    await pumpImage(tester);
++
++    final handle = find.byKey(const ValueKey('imageRotateHandle'));
++    final imageCentre = tester.getCenter(find.byType(Image));
++
++    // 手指从箭头出发，但中途穿过图片中心：那里角度是噪声，
++    // 不该让图片乱甩（死区保护的回归测试）
++    final gesture = await tester.startGesture(tester.getCenter(handle));
++    await tester.pump();
++    await gesture.moveTo(imageCentre + const Offset(0, -60));
++    await tester.pump();
++    final degreesBeforeCentre = image.rotationDegrees;
++    await gesture.moveTo(imageCentre + const Offset(2, 0));
++    await tester.pump();
++    await gesture.up();
++    await tester.pump();
++
++    expect(image.rotationDegrees, degreesBeforeCentre);
++  });
++
++  testWidgets('the crop layer stays centred on the image', (tester) async {
++    await pumpImage(tester);
++
++    // 点动作条上的「裁剪」进入裁剪模式
++    await tester.tap(find.byTooltip('裁剪'));
++    await tester.pumpAndSettle();
++
++    final overlay = find.byType(ImageCropOverlay);
++    expect(overlay, findsOneWidget);
++
++    // 裁剪层自己的盒子 = 图片外扩 handlePadding（它内部再按 padding 摆裁剪框）
++    final imageRect = tester.getRect(find.byType(Image));
++    final overlayRect = tester.getRect(overlay);
++    const pad = CanvasImage.handlePadding;
++    expect(overlayRect.left, closeTo(imageRect.left - pad, 0.5));
++    expect(overlayRect.top, closeTo(imageRect.top - pad, 0.5));
++    expect(overlayRect.width, closeTo(imageRect.width + pad * 2, 0.5));
++    expect(overlayRect.height, closeTo(imageRect.height + pad * 2, 0.5));
++  });
++}

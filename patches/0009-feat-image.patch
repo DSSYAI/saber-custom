@@ -1,0 +1,1130 @@
+From 8f17427d44db240bcc07d19c7ba01bd7db3dada3 Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 11:48:29 +0800
+Subject: [PATCH 09/14] =?UTF-8?q?feat(image):=20=E5=9B=BE=E7=89=87?=
+ =?UTF-8?q?=E8=A3=81=E5=89=AA=20=E2=80=94=E2=80=94=20=E9=80=89=E4=B8=AD?=
+ =?UTF-8?q?=E5=9B=BE=E7=89=87=E5=90=8E=E5=9C=A8=E4=B8=8B=E6=96=B9=E6=B5=AE?=
+ =?UTF-8?q?=E5=87=BA=E5=8A=A8=E4=BD=9C=E6=9D=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+点图片选中后，图片下方浮出动作条：裁剪 / 重置裁剪 / 删除。
+点「裁剪」进入裁剪模式：整张图显示出来、框外压暗、8 个把手自由拖动裁剪框、
+框内拖动整体移动；点「完成」或**点图片以外的空白处**即确认（记一条撤销、
+触发自动保存）；「取消」放弃本次修改。
+
+实现要点：
+- 裁剪结果复用 A 批修好的 srcRect 渲染路径，所以确认后立刻可见
+- srcRect 始终相对**原图**，因此重新裁剪时能把之前裁掉的部分再框回来
+  （自由比例、非破坏式）
+- 裁剪框的真值放在 CanvasImage 的状态里，ImageCropOverlay 只做交互与显示，
+  单向数据流
+- 撤销：EditorHistoryItem 新增 changeSrcRect 类型 + Map<EditorImage, Change<Rect>>，
+  完全比照已有的 changeColor / backgroundPattern 模式；undo/redo 两个 switch
+  都补了分支
+- EditorImage.onCropImage 刻意做成**可选的可变字段**而不是 required 构造参数：
+  那三个既有回调是 required 的，加第四个要改三个子类 × (构造函数 + fromJson +
+  copy) 和所有构造点。改为可选后只需在 editor 装配处赋值；
+  copy() 里用级联补上，保证复制页面出来的图片也能裁剪。
+- 裁剪模式下禁用图片自身的拖动/缩放/长按菜单，避免与裁剪框手势打架
+- 未裁剪时一整段旧渲染原样保留，golden 逐张通过证明输出未变
+
+测试：
+- 新增 test/image_crop_overlay_test.dart（7 例）：把手位置、四边拖动、
+  最小尺寸、边界夹取、框内平移
+- 这组测试当场抓出一个真 bug：把手定位只乘了 display.width/height，
+  忘了加 display.left/top，导致裁剪框不在左上角时把手全挤到左上角附近
+
+已知限制：主页卡片/页面管理器里的**缩略图**仍不显示裁剪（缩略图的 srcRect 在
+缩略图坐标系，与 naturalSize 不同源）。主画布与导出都是准的。
+---
+ lib/components/canvas/canvas_image.dart       | 321 ++++++++++++++++--
+ lib/components/canvas/image/editor_image.dart |  16 +
+ .../canvas/image/pdf_editor_image.dart        |   2 +-
+ .../canvas/image/png_editor_image.dart        |   2 +-
+ .../canvas/image/svg_editor_image.dart        |   2 +-
+ lib/components/canvas/image_crop_overlay.dart | 201 +++++++++++
+ lib/components/canvas/inner_canvas.dart       |  14 +
+ lib/data/editor/editor_history.dart           |  13 +
+ lib/pages/editor/editor.dart                  |  43 +++
+ test/image_crop_overlay_test.dart             | 188 ++++++++++
+ 10 files changed, 772 insertions(+), 30 deletions(-)
+ create mode 100644 lib/components/canvas/image_crop_overlay.dart
+ create mode 100644 test/image_crop_overlay_test.dart
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index 8680455c..b7914aa5 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -6,6 +6,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:saber/components/canvas/canvas_image_dialog.dart';
+ import 'package:saber/components/canvas/cropped_image.dart';
+ import 'package:saber/components/canvas/image/editor_image.dart';
++import 'package:saber/components/canvas/image_crop_overlay.dart';
+ import 'package:saber/components/theming/adaptive_alert_dialog.dart';
+ import 'package:saber/data/extensions/change_notifier_extensions.dart';
+ import 'package:saber/data/prefs.dart';
+@@ -67,6 +68,18 @@ class CanvasImage extends StatefulHookWidget {
+         (srcRect.height - sourceSize.height).abs() > epsilon;
+   }
+ 
++  /// 个人自用版：当前是否有图片处于裁剪模式。
++  ///
++  /// 画布（InnerCanvas）监听它，在裁剪时铺一层透明的"点空白处完成裁剪"捕获层。
++  /// 同一时刻最多只有一张图片在裁剪（由 [activeListener] 保证独占）。
++  static final ValueNotifier<bool> anyCropping = ValueNotifier(false);
++
++  /// 个人自用版：结束当前裁剪模式。由正在裁剪的图片注册。
++  static VoidCallback? _finishCropCallback;
++
++  /// 个人自用版：结束当前裁剪模式。画布在用户点击空白处时调用。
++  static void finishCrop() => _finishCropCallback?.call();
++
+   @override
+   State<CanvasImage> createState() => _CanvasImageState();
+ }
+@@ -74,6 +87,13 @@ class CanvasImage extends StatefulHookWidget {
+ class _CanvasImageState extends State<CanvasImage> {
+   var _active = false;
+ 
++  /// 个人自用版：是否处于裁剪模式。
++  var _cropping = false;
++
++  /// 个人自用版：裁剪模式中待确认的裁剪框（源图像素）。
++  /// 只有点「完成」或点空白处才写回 [EditorImage.srcRect]。
++  Rect _pendingCrop = .zero;
++
+   /// Whether this image can be dragged
+   bool get active => _active;
+   set active(bool value) {
+@@ -85,6 +105,9 @@ class _CanvasImageState extends State<CanvasImage> {
+     }
+ 
+     _active = value;
++    // 个人自用版：图片被取消选中时，未确认的裁剪直接丢弃。
++    // 这里可能是 build 期间被调用（readOnly），所以不能回调外面（会 setState）。
++    if (!value) _exitCropMode(apply: false);
+ 
+     if (mounted) {
+       try {
+@@ -97,6 +120,82 @@ class _CanvasImageState extends State<CanvasImage> {
+ 
+   Brightness imageBrightness = .light;
+ 
++  /// 个人自用版：这张图片是否支持裁剪。
++  ///
++  /// 需要：可交互（编辑器 + 选择工具 + 非只读）、不是页面背景图、
++  /// 而且源图尺寸已经加载出来。
++  bool get canCrop =>
++      !widget.readOnly &&
++      !widget.isBackground &&
++      widget.image.naturalSize.shortestSide > 0;
++
++  /// 个人自用版：进入裁剪模式。
++  void enterCropMode() {
++    if (!canCrop) return;
++
++    final image = widget.image;
++    final full = Offset.zero & image.naturalSize;
++    final alreadyCropped = CanvasImage.isCropped(
++      srcRect: image.srcRect,
++      sourceSize: image.naturalSize,
++      isThumbnail: image.isThumbnail,
++    );
++
++    setState(() {
++      _cropping = true;
++      // 起点：裁剪过就沿用当前框。因为 srcRect 始终相对**原图**，
++      // 所以重新裁剪时可以把之前裁掉的部分再框回来。
++      _pendingCrop = alreadyCropped ? image.srcRect : full;
++    });
++
++    CanvasImage._finishCropCallback = () {
++      if (!mounted) return;
++      _exitCropMode();
++      setState(() {});
++    };
++    CanvasImage.anyCropping.value = true;
++  }
++
++  /// 个人自用版：退出裁剪模式。
++  ///
++  /// [apply] 为真则把 [_pendingCrop] 写回图片并记一条撤销。
++  /// 注意：可能被 build 期间（readOnly）或 dispose 期间调用，
++  /// 所以为 false 时不能回调外部（外部回调会 setState）。
++  void _exitCropMode({bool apply = true}) {
++    if (!_cropping) return;
++
++    final previous = widget.image.srcRect;
++    final next = apply ? _pendingCrop : previous;
++
++    _cropping = false;
++    _pendingCrop = .zero;
++    if (CanvasImage._finishCropCallback != null) {
++      CanvasImage._finishCropCallback = null;
++      CanvasImage.anyCropping.value = false;
++    }
++
++    if (next == previous) return;
++    if (next.width <= 0 || next.height <= 0) return;
++
++    widget.image.srcRect = next;
++    widget.image.notifySrcRectChanged();
++    widget.image.onCropImage?.call(widget.image, previous, next);
++  }
++
++  /// 个人自用版：把裁剪恢复成整张图（同样记一条撤销）。
++  void resetCrop() {
++    final image = widget.image;
++    final previous = image.srcRect;
++    final full = Offset.zero & image.naturalSize;
++    if (full.width <= 0 || previous == full) return;
++
++    setState(() {
++      image.srcRect = full;
++      image.notifySrcRectChanged();
++    });
++    image.onCropImage?.call(image, previous, full);
++  }
++
+   Rect panStartRect = .zero;
+   Offset panStartPosition = .zero;
+ 
+@@ -116,6 +215,11 @@ class _CanvasImageState extends State<CanvasImage> {
+   }
+ 
+   void disableActive() {
++    // 个人自用版：另一张图片被选中时，先把当前这次裁剪确认下来再取消选中
++    if (_cropping) {
++      _exitCropMode();
++      if (mounted) setState(() {});
++    }
+     active = false;
+   }
+ 
+@@ -143,11 +247,23 @@ class _CanvasImageState extends State<CanvasImage> {
+ 
+     // 个人自用版：只有"确实裁剪了"才走裁剪渲染。
+     // 未裁剪时保留改动前的整段渲染，输出逐像素不变（golden 测试守住这一点）。
+-    final bool cropped = CanvasImage.isCropped(
++    //
++    // 裁剪模式下刻意按"整张图"渲染（cropped = false），这样用户能看到被裁掉的
++    // 部分，裁剪框再叠在它上面。
++    final bool imageIsCropped = CanvasImage.isCropped(
+       srcRect: widget.image.srcRect,
+       sourceSize: widget.image.naturalSize,
+       isThumbnail: widget.image.isThumbnail,
+     );
++    final bool cropped = !_cropping && imageIsCropped;
++
++    // 图片在屏幕上的显示尺寸（必须与下面 SizedBox 的算法一致）
++    final double boxWidth = widget.isBackground
++        ? widget.pageSize.width
++        : max(widget.image.dstRect.width, CanvasImage.minImageSize);
++    final double boxHeight = widget.isBackground
++        ? widget.pageSize.height
++        : max(widget.image.dstRect.height, CanvasImage.minImageSize);
+ 
+     final Widget unpositioned = IgnorePointer(
+       ignoring: widget.readOnly,
+@@ -158,17 +274,19 @@ class _CanvasImageState extends State<CanvasImage> {
+             cursor: active ? SystemMouseCursors.grab : MouseCursor.defer,
+             child: GestureDetector(
+               behavior: HitTestBehavior.opaque,
+-              onTap: () {
+-                active = !active;
+-              },
+-              onLongPress: active ? showModal : null,
+-              onSecondaryTap: active ? showModal : null,
+-              onPanStart: active
++              onTap: _cropping
++                  ? null
++                  : () {
++                      active = !active;
++                    },
++              onLongPress: active && !_cropping ? showModal : null,
++              onSecondaryTap: active && !_cropping ? showModal : null,
++              onPanStart: active && !_cropping
+                   ? (details) {
+                       panStartRect = widget.image.dstRect;
+                     }
+                   : null,
+-              onPanUpdate: active
++              onPanUpdate: active && !_cropping
+                   ? (details) {
+                       setState(() {
+                         final fivePercent = min(
+@@ -194,7 +312,7 @@ class _CanvasImageState extends State<CanvasImage> {
+                       });
+                     }
+                   : null,
+-              onPanEnd: active
++              onPanEnd: active && !_cropping
+                   ? (details) {
+                       if (panStartRect == widget.image.dstRect) return;
+                       widget.image.onMoveImage?.call(
+@@ -218,31 +336,37 @@ class _CanvasImageState extends State<CanvasImage> {
+                 ),
+                 child: Center(
+                   child: SizedBox(
+-                    width: widget.isBackground
+-                        ? widget.pageSize.width
+-                        : max(
+-                            widget.image.dstRect.width,
+-                            CanvasImage.minImageSize,
+-                          ),
+-                    height: widget.isBackground
+-                        ? widget.pageSize.height
+-                        : max(
+-                            widget.image.dstRect.height,
+-                            CanvasImage.minImageSize,
+-                          ),
+-                    child: cropped
+-                        ? CroppedImage(
++                    width: boxWidth,
++                    height: boxHeight,
++                    child: Stack(
++                      fit: StackFit.expand,
++                      children: [
++                        if (cropped)
++                          CroppedImage(
+                             srcRect: widget.image.srcRect,
+                             sourceSize: widget.image.naturalSize,
+                             child: imageWidget,
+                           )
+-                        : SizedOverflowBox(
++                        else
++                          SizedOverflowBox(
+                             size: widget.image.srcRect.size,
+                             child: Transform.translate(
+                               offset: -widget.image.srcRect.topLeft,
+                               child: imageWidget,
+                             ),
+                           ),
++
++                        // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）
++                        if (_cropping)
++                          ImageCropOverlay(
++                            cropRect: _pendingCrop,
++                            sourceSize: widget.image.naturalSize,
++                            boxSize: Size(boxWidth, boxHeight),
++                            onChanged: (cropRect) =>
++                                setState(() => _pendingCrop = cropRect),
++                          ),
++                      ],
++                    ),
+                   ),
+                 ),
+               ),
+@@ -250,7 +374,7 @@ class _CanvasImageState extends State<CanvasImage> {
+           ),
+           if (widget.selected) // tint image if selected
+             ColoredBox(color: colorScheme.primary.withValues(alpha: 0.5)),
+-          if (!widget.readOnly)
++          if (!widget.readOnly && !_cropping)
+             for (double x = -20; x <= 20; x += 20)
+               for (double y = -20; y <= 20; y += 20)
+                 if (x != 0 || y != 0) // ignore (0,0)
+@@ -276,9 +400,48 @@ class _CanvasImageState extends State<CanvasImage> {
+         child: unpositioned,
+       );
+     }
++    // 个人自用版：选中时在图片**下方**浮出动作条。
++    // 外层必须 Clip.none，否则超出图片框的动作条会被裁掉。
++    final Widget withActionBar = Stack(
++      clipBehavior: Clip.none,
++      fit: StackFit.expand,
++      children: [
++        unpositioned,
++        if (active && !widget.readOnly && !widget.isBackground)
++          Positioned(
++            left: 0,
++            right: 0,
++            top: boxHeight + 8,
++            child: DeferPointer(
++              paintOnTop: true,
++              child: Center(
++                child: _CanvasImageActionBar(
++                  cropping: _cropping,
++                  canCrop: canCrop,
++                  canResetCrop: imageIsCropped,
++                  onCrop: enterCropMode,
++                  onFinishCrop: () {
++                    _exitCropMode();
++                    setState(() {});
++                  },
++                  onCancelCrop: () {
++                    setState(() => _exitCropMode(apply: false));
++                  },
++                  onResetCrop: resetCrop,
++                  onDelete: () {
++                    active = false;
++                    widget.image.onDeleteImage?.call(widget.image);
++                  },
++                ),
++              ),
++            ),
++          ),
++      ],
++    );
++
+     return AnimatedPositioned(
+       // no animation if the image is being dragged or it's selected
+-      duration: (panStartRect != .zero || widget.selected)
++      duration: (panStartRect != .zero || widget.selected || _cropping)
+           ? Duration.zero
+           : const Duration(milliseconds: 300),
+       curve: Curves.fastLinearToSlowEaseIn,
+@@ -288,12 +451,22 @@ class _CanvasImageState extends State<CanvasImage> {
+       width: max(widget.image.dstRect.width, CanvasImage.minInteractiveSize),
+       height: max(widget.image.dstRect.height, CanvasImage.minInteractiveSize),
+ 
+-      child: unpositioned,
++      child: withActionBar,
+     );
+   }
+ 
+   @override
+   void dispose() {
++    if (_cropping) {
++      _cropping = false;
++      _pendingCrop = .zero;
++      CanvasImage._finishCropCallback = null;
++      // dispose 发生在 build 阶段内，不能同步通知监听者（会让祖先 setState），
++      // 所以推迟到本帧结束之后再撤掉「点空白完成裁剪」的捕获层。
++      WidgetsBinding.instance.addPostFrameCallback((_) {
++        CanvasImage.anyCropping.value = false;
++      });
++    }
+     widget.image.loadOut();
+     CanvasImage.activeListener.removeListener(disableActive);
+     super.dispose();
+@@ -460,3 +633,97 @@ class _CanvasImageResizeHandle extends StatelessWidget {
+     );
+   }
+ }
++
++/// 个人自用版：图片被选中时浮在图片**下方**的动作条。
++///
++/// 不在裁剪模式时是「裁剪 / 重置裁剪 / 删除」；裁剪模式中换成「完成 / 取消」。
++/// 长按菜单（[CanvasImageDialog]）保持原样不动。
++class _CanvasImageActionBar extends StatelessWidget {
++  const new({
++    required this.cropping,
++    required this.canCrop,
++    required this.canResetCrop,
++    required this.onCrop,
++    required this.onFinishCrop,
++    required this.onCancelCrop,
++    required this.onResetCrop,
++    required this.onDelete,
++  });
++
++  final bool cropping;
++  final bool canCrop;
++  final bool canResetCrop;
++  final VoidCallback onCrop;
++  final VoidCallback onFinishCrop;
++  final VoidCallback onCancelCrop;
++  final VoidCallback onResetCrop;
++  final VoidCallback onDelete;
++
++  @override
++  Widget build(BuildContext context) {
++    final colorScheme = ColorScheme.of(context);
++    return Material(
++      color: colorScheme.surfaceContainerHighest,
++      elevation: 3,
++      borderRadius: const .all(.circular(24)),
++      child: Padding(
++        padding: const .symmetric(horizontal: 2, vertical: 2),
++        child: Row(
++          mainAxisSize: .min,
++          children: [
++            if (cropping) ...[
++              _button(
++                icon: Icons.check,
++                // 个人自用版：未走 i18n
++                tooltip: '完成裁剪',
++                onTap: onFinishCrop,
++              ),
++              _button(
++                icon: Icons.close,
++                // 个人自用版：未走 i18n
++                tooltip: '取消裁剪',
++                onTap: onCancelCrop,
++              ),
++            ] else ...[
++              if (canCrop)
++                _button(
++                  icon: Icons.crop,
++                  // 个人自用版：未走 i18n
++                  tooltip: '裁剪',
++                  onTap: onCrop,
++                ),
++              if (canResetCrop)
++                _button(
++                  icon: Icons.restart_alt,
++                  // 个人自用版：未走 i18n
++                  tooltip: '重置裁剪',
++                  onTap: onResetCrop,
++                ),
++              _button(
++                icon: Icons.delete_outline,
++                // 个人自用版：未走 i18n
++                tooltip: '删除图片',
++                onTap: onDelete,
++              ),
++            ],
++          ],
++        ),
++      ),
++    );
++  }
++
++  Widget _button({
++    required IconData icon,
++    required String tooltip,
++    required VoidCallback onTap,
++  }) {
++    return IconButton(
++      onPressed: onTap,
++      icon: Icon(icon, size: 20),
++      tooltip: tooltip,
++      visualDensity: VisualDensity.compact,
++      padding: EdgeInsets.zero,
++      constraints: const BoxConstraints.tightFor(width: 38, height: 38),
++    );
++  }
++}
+diff --git a/lib/components/canvas/image/editor_image.dart b/lib/components/canvas/image/editor_image.dart
+index e0e500ad..62f3bdb8 100644
+--- a/lib/components/canvas/image/editor_image.dart
++++ b/lib/components/canvas/image/editor_image.dart
+@@ -46,8 +46,24 @@ sealed class EditorImage extends ChangeNotifier {
+   void Function(EditorImage, Rect)? onMoveImage;
+   void Function(EditorImage)? onDeleteImage;
+   void Function()? onMiscChange;
++
++  /// 个人自用版：裁剪完成时回调。
++  /// 参数是（图片, 裁剪前的 srcRect, 裁剪后的 srcRect），用于记录撤销。
++  ///
++  /// 与 [onMoveImage] / [onDeleteImage] 同构，但刻意做成**可选的可变字段**而不是
++  /// 构造参数：那三个是 `required` 的，加第四个就要改三个子类的构造函数、
++  /// 三处 `fromJson`、三处 `copy()` 和所有构造点。裁剪只发生在可交互的图片上，
++  /// 由 editor 在装配图片时赋值即可。
++  void Function(EditorImage image, Rect previous, Rect current)? onCropImage;
++
+   final VoidCallback? onLoad;
+ 
++  /// 个人自用版：srcRect（裁剪框）变更后通知界面重绘。
++  ///
++  /// [srcRect] 是普通字段，不像 [dstRect] 那样自带走 setter 通知，
++  /// 所以改完要显式调一次这个。
++  void notifySrcRectChanged() => notifyListeners();
++
+   Rect srcRect = .zero;
+ 
+   late var _dstRect = Rect.fromLTWH(
+diff --git a/lib/components/canvas/image/pdf_editor_image.dart b/lib/components/canvas/image/pdf_editor_image.dart
+index e8610b66..4aa7d83c 100644
+--- a/lib/components/canvas/image/pdf_editor_image.dart
++++ b/lib/components/canvas/image/pdf_editor_image.dart
+@@ -203,7 +203,7 @@ class PdfEditorImage extends EditorImage {
+     dstRect: dstRect,
+     naturalSize: naturalSize,
+     isThumbnail: isThumbnail,
+-  );
++  )..onCropImage = onCropImage;
+ 
+   @override
+   void dispose() {
+diff --git a/lib/components/canvas/image/png_editor_image.dart b/lib/components/canvas/image/png_editor_image.dart
+index 11b6d76f..4580d77f 100644
+--- a/lib/components/canvas/image/png_editor_image.dart
++++ b/lib/components/canvas/image/png_editor_image.dart
+@@ -237,5 +237,5 @@ class PngEditorImage extends EditorImage {
+     naturalSize: naturalSize,
+     thumbnailBytes: thumbnailBytes,
+     isThumbnail: isThumbnail,
+-  );
++  )..onCropImage = onCropImage;
+ }
+diff --git a/lib/components/canvas/image/svg_editor_image.dart b/lib/components/canvas/image/svg_editor_image.dart
+index 3cbe1edb..36f87eec 100644
+--- a/lib/components/canvas/image/svg_editor_image.dart
++++ b/lib/components/canvas/image/svg_editor_image.dart
+@@ -208,6 +208,6 @@ class SvgEditorImage extends EditorImage {
+       srcRect: srcRect,
+       naturalSize: naturalSize,
+       isThumbnail: isThumbnail,
+-    );
++    )..onCropImage = onCropImage;
+   }
+ }
+diff --git a/lib/components/canvas/image_crop_overlay.dart b/lib/components/canvas/image_crop_overlay.dart
+new file mode 100644
+index 00000000..9da180c2
+--- /dev/null
++++ b/lib/components/canvas/image_crop_overlay.dart
+@@ -0,0 +1,201 @@
++import 'dart:math';
++
++import 'package:flutter/material.dart';
++
++/// 个人自用版：图片裁剪的交互层，覆盖在**整张图**之上。
++///
++/// - 裁剪框以外压暗
++/// - 框内拖动可整体移动裁剪框
++/// - 8 个把手拖动改框，自由比例（不锁宽高比）
++///
++/// 坐标系：`cropRect` / `sourceSize` 是**源图像素**，`boxSize` 是图片在屏幕上
++/// 的显示尺寸。本 widget 只负责交互与显示，裁剪框的真值由父级持有，
++/// 每次变化通过 [onChanged] 上报（单向数据流，父级重建）。
++class ImageCropOverlay extends StatelessWidget {
++  const new({
++    super.key,
++    required this.cropRect,
++    required this.sourceSize,
++    required this.boxSize,
++    required this.onChanged,
++  });
++
++  /// 当前裁剪框，单位是源图像素。
++  final Rect cropRect;
++
++  /// 整张图的像素尺寸，[cropRect] 的坐标系。
++  final Size sourceSize;
++
++  /// 图片在屏幕上的显示尺寸。
++  final Size boxSize;
++
++  /// 裁剪框变化时回调（参数为新的裁剪框，源图像素）。
++  final ValueChanged<Rect> onChanged;
++
++  /// 裁剪框的最小边长，单位源图像素。防止拖成一条线。
++  static const minCropSize = 24.0;
++
++  /// 把手（拖动点）的直径。
++  static const _handleSize = 40.0;
++
++  /// 把源图像素的矩形换算成显示坐标。
++  static Rect toDisplay(Rect rect, Size sourceSize, Size boxSize) => Rect.fromLTRB(
++    rect.left / sourceSize.width * boxSize.width,
++    rect.top / sourceSize.height * boxSize.height,
++    rect.right / sourceSize.width * boxSize.width,
++    rect.bottom / sourceSize.height * boxSize.height,
++  );
++
++  /// 屏幕上的位移换算成源图像素上的位移。
++  Offset _toSourceDelta(Offset delta) => Offset(
++    delta.dx / boxSize.width * sourceSize.width,
++    delta.dy / boxSize.height * sourceSize.height,
++  );
++
++  /// 拖动某个把手。[position] 的每个分量是 -1/0/1，表示拖的是哪条边。
++  void _dragHandle(Offset position, Offset delta) {
++    final sourceDelta = _toSourceDelta(delta);
++    var left = cropRect.left;
++    var top = cropRect.top;
++    var right = cropRect.right;
++    var bottom = cropRect.bottom;
++
++    // 每条边都夹在 [图片边界] 与 [对面的边 - 最小尺寸] 之间。
++    // cropRect 始终保证 width/height >= minCropSize，所以这里的夹取下界
++    // 一定不会超过上界。
++    if (position.dx < 0) left = (left + sourceDelta.dx).clamp(0.0, right - minCropSize);
++    if (position.dx > 0) right = (right + sourceDelta.dx).clamp(left + minCropSize, sourceSize.width);
++    if (position.dy < 0) top = (top + sourceDelta.dy).clamp(0.0, bottom - minCropSize);
++    if (position.dy > 0) bottom = (bottom + sourceDelta.dy).clamp(top + minCropSize, sourceSize.height);
++
++    onChanged(Rect.fromLTRB(left, top, right, bottom));
++  }
++
++  /// 拖动裁剪框本身（整体平移，不改变大小）。
++  void _dragCropRect(Offset delta) {
++    final sourceDelta = _toSourceDelta(delta);
++    onChanged(
++      Rect.fromLTWH(
++        (cropRect.left + sourceDelta.dx).clamp(
++          0.0,
++          max(0.0, sourceSize.width - cropRect.width),
++        ),
++        (cropRect.top + sourceDelta.dy).clamp(
++          0.0,
++          max(0.0, sourceSize.height - cropRect.height),
++        ),
++        cropRect.width,
++        cropRect.height,
++      ),
++    );
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    final display = toDisplay(cropRect, sourceSize, boxSize);
++    final scrim = Colors.black.withValues(alpha: 0.45);
++
++    return Stack(
++      children: [
++        // 裁剪框以外的四个方向压暗
++        Positioned(
++          left: 0,
++          top: 0,
++          width: boxSize.width,
++          height: max(0, display.top),
++          child: ColoredBox(color: scrim),
++        ),
++        Positioned(
++          left: 0,
++          top: display.bottom,
++          width: boxSize.width,
++          height: max(0, boxSize.height - display.bottom),
++          child: ColoredBox(color: scrim),
++        ),
++        Positioned(
++          left: 0,
++          top: display.top,
++          width: max(0, display.left),
++          height: display.height,
++          child: ColoredBox(color: scrim),
++        ),
++        Positioned(
++          left: display.right,
++          top: display.top,
++          width: max(0, boxSize.width - display.right),
++          height: display.height,
++          child: ColoredBox(color: scrim),
++        ),
++
++        // 框内拖动 = 整体移动裁剪框（放在把手下面，避免盖住把手）
++        Positioned(
++          left: display.left,
++          top: display.top,
++          width: display.width,
++          height: display.height,
++          child: GestureDetector(
++            behavior: HitTestBehavior.opaque,
++            onPanUpdate: (details) => _dragCropRect(details.delta),
++          ),
++        ),
++
++        // 裁剪框边框
++        Positioned(
++          left: display.left,
++          top: display.top,
++          width: display.width,
++          height: display.height,
++          child: IgnorePointer(
++            child: DecoratedBox(
++              decoration: BoxDecoration(
++                border: Border.all(color: Colors.white, width: 2),
++              ),
++            ),
++          ),
++        ),
++
++        for (double x = -1; x <= 1; x += 1)
++          for (double y = -1; y <= 1; y += 1)
++            if (x != 0 || y != 0) _handle(context, Offset(x, y), display),
++      ],
++    );
++  }
++
++  /// 把手的 key，便于测试按位置精确点到某个把手。
++  @visibleForTesting
++  static Key handleKey(Offset position) =>
++      ValueKey('cropHandle${position.dx},${position.dy}');
++
++  Widget _handle(BuildContext context, Offset position, Rect display) {
++    final colorScheme = ColorScheme.of(context);
++    return Positioned(
++      // 注意要加上 display.left/top：裁剪框不一定贴着图片左上角，
++      // 只乘 display.width/height 会把所有把手挤到左上角附近。
++      left:
++          display.left +
++          (position.dx + 1) / 2 * display.width -
++          _handleSize / 2,
++      top:
++          display.top +
++          (position.dy + 1) / 2 * display.height -
++          _handleSize / 2,
++      child: MouseRegion(
++        cursor: SystemMouseCursors.precise,
++        child: GestureDetector(
++          key: handleKey(position),
++          behavior: HitTestBehavior.opaque,
++          onPanUpdate: (details) => _dragHandle(position, details.delta),
++          child: Container(
++            width: _handleSize,
++            height: _handleSize,
++            decoration: BoxDecoration(
++              color: colorScheme.onSurface,
++              shape: .circle,
++              border: Border.all(color: colorScheme.surface, width: 2),
++            ),
++          ),
++        ),
++      ),
++    );
++  }
++}
+diff --git a/lib/components/canvas/inner_canvas.dart b/lib/components/canvas/inner_canvas.dart
+index ae25862b..1db7438c 100644
+--- a/lib/components/canvas/inner_canvas.dart
++++ b/lib/components/canvas/inner_canvas.dart
+@@ -167,6 +167,20 @@ class _InnerCanvasState extends State<InnerCanvas> {
+                     child: quillEditor,
+                   ),
+                 ),
++                // 个人自用版：裁剪模式下，点图片以外的空白处即完成裁剪。
++                // 放在图片**之前**，所以点图片仍然命中图片本身。
++                ValueListenableBuilder(
++                  valueListenable: CanvasImage.anyCropping,
++                  builder: (context, cropping, child) {
++                    if (!cropping) return const SizedBox.shrink();
++                    return Positioned.fill(
++                      child: GestureDetector(
++                        behavior: HitTestBehavior.opaque,
++                        onTap: CanvasImage.finishCrop,
++                      ),
++                    );
++                  },
++                ),
+                 for (int i = 0; i < page.images.length; i++)
+                   CanvasImage(
+                     filePath: widget.coreInfo.filePath,
+diff --git a/lib/data/editor/editor_history.dart b/lib/data/editor/editor_history.dart
+index 61df1e2e..71ec7e6e 100644
+--- a/lib/data/editor/editor_history.dart
++++ b/lib/data/editor/editor_history.dart
+@@ -149,6 +149,7 @@ class EditorHistoryItem {
+     this.quillChange,
+     this.colorChange,
+     this.backgroundPatternChange,
++    this.srcRectChange,
+   }) : assert(
+          type != .move || offset != null,
+          'Offset must be provided for move',
+@@ -176,6 +177,10 @@ class EditorHistoryItem {
+        assert(
+          type != .backgroundPattern || backgroundPatternChange != null,
+          'Background pattern change must be provided for backgroundPattern',
++       ),
++       assert(
++         type != .changeSrcRect || srcRectChange != null,
++         'srcRectChange must be provided for changeSrcRect',
+        );
+ 
+   final EditorHistoryItemType type;
+@@ -188,6 +193,9 @@ class EditorHistoryItem {
+   final Map<Stroke, Change<Color>>? colorChange;
+   final Change<CanvasBackgroundPattern>? backgroundPatternChange;
+ 
++  /// 个人自用版：图片裁剪（`EditorImage.srcRect` 变化）的前后值。
++  final Map<EditorImage, Change<Rect>>? srcRectChange;
++
+   EditorHistoryItem copyWith({
+     EditorHistoryItemType? type,
+     int? pageIndex,
+@@ -198,6 +206,7 @@ class EditorHistoryItem {
+     DocChange? quillChange,
+     Map<Stroke, Change<Color>>? colorChange,
+     Change<CanvasBackgroundPattern>? backgroundPatternChange,
++    Map<EditorImage, Change<Rect>>? srcRectChange,
+   }) {
+     return EditorHistoryItem(
+       type: type ?? this.type,
+@@ -210,6 +219,7 @@ class EditorHistoryItem {
+       colorChange: colorChange ?? this.colorChange,
+       backgroundPatternChange:
+           backgroundPatternChange ?? this.backgroundPatternChange,
++      srcRectChange: srcRectChange ?? this.srcRectChange,
+     );
+   }
+ }
+@@ -224,4 +234,7 @@ enum EditorHistoryItemType {
+   quillUndoneChange,
+   changeColor,
+   backgroundPattern,
++
++  /// 个人自用版：图片裁剪
++  changeSrcRect,
+ }
+diff --git a/lib/pages/editor/editor.dart b/lib/pages/editor/editor.dart
+index 2979b95c..5f7132c6 100644
+--- a/lib/pages/editor/editor.dart
++++ b/lib/pages/editor/editor.dart
+@@ -231,6 +231,7 @@ class EditorState extends State<Editor> {
+           image.onMoveImage = onMoveImage;
+           image.onDeleteImage = onDeleteImage;
+           image.onMiscChange = autosaveAfterDelay;
++          image.onCropImage = onCropImage;
+         }
+       }
+     }
+@@ -436,6 +437,13 @@ class EditorState extends State<Editor> {
+ 
+         case .backgroundPattern:
+           coreInfo.backgroundPattern = item.backgroundPatternChange!.previous;
++
++        case .changeSrcRect:
++          // 个人自用版：撤销裁剪
++          for (final entry in item.srcRectChange!.entries) {
++            entry.key.srcRect = entry.value.previous;
++            entry.key.notifySrcRectChanged();
++          }
+       }
+ 
+       if (item.type != .move) {
+@@ -488,6 +496,15 @@ class EditorState extends State<Editor> {
+             backgroundPatternChange: item.backgroundPatternChange!.reverse(),
+           ),
+         );
++      case .changeSrcRect:
++        // 个人自用版：重做裁剪
++        undo(
++          item.copyWith(
++            srcRectChange: item.srcRectChange!.map(
++              (key, value) => MapEntry(key, value.reverse()),
++            ),
++          ),
++        );
+     }
+   }
+ 
+@@ -793,6 +810,26 @@ class EditorState extends State<Editor> {
+     autosaveAfterDelay();
+   }
+ 
++  /// 个人自用版：记录一次裁剪（`srcRect` 从 [previous] 变成 [current]），用于撤销。
++  ///
++  /// 与 [onMoveImage] 同构。调用方（CanvasImage）已经在界面上改好 `srcRect`。
++  void onCropImage(EditorImage image, Rect previous, Rect current) {
++    if (previous == current) return;
++
++    history.recordChange(
++      EditorHistoryItem(
++        type: .changeSrcRect,
++        pageIndex: image.pageIndex,
++        strokes: [],
++        images: [image],
++        srcRectChange: {image: Change(previous: previous, current: current)},
++      ),
++    );
++    // setState to update undo button
++    setState(() {});
++    autosaveAfterDelay();
++  }
++
+   void listenToQuillChanges(QuillStruct quill, int pageIndex) {
+     quill.changeSubscription?.cancel();
+     quill.changeSubscription = quill.controller.changes.listen((event) {
+@@ -1097,6 +1134,12 @@ class EditorState extends State<Editor> {
+           ),
+     ];
+ 
++    // 个人自用版：新导入的图片也要能裁剪。
++    // onCropImage 不是构造参数（见 EditorImage 里的说明），所以手动装上。
++    for (final image in images) {
++      image.onCropImage = onCropImage;
++    }
++
+     history.recordChange(
+       EditorHistoryItem(
+         type: .draw,
+diff --git a/test/image_crop_overlay_test.dart b/test/image_crop_overlay_test.dart
+new file mode 100644
+index 00000000..f7172758
+--- /dev/null
++++ b/test/image_crop_overlay_test.dart
+@@ -0,0 +1,188 @@
++import 'package:flutter/material.dart';
++import 'package:flutter_test/flutter_test.dart';
++import 'package:saber/components/canvas/image_crop_overlay.dart';
++
++/// 个人自用版：裁剪框交互层的几何验证。
++///
++/// 只验证"拖动 → 新的裁剪框"这段纯几何逻辑（源图像素 ↔ 屏幕像素换算、
++/// 边界夹取、最小尺寸、把手位置），不涉及完整编辑器的装配。
++///
++/// 断言用**极大的拖动距离**触发夹取，这样触摸 slop 消耗掉的那几个像素
++/// 不影响结果，测试不会因为 slop 常数变化而变脆。
++void main() {
++  const sourceSize = Size(200, 200);
++  const boxSize = Size(100, 100);
++  // 源图 200px 显示在 100px 的框里 → 屏幕 1px = 源图 2px
++  const fullCrop = Rect.fromLTWH(0, 0, 200, 200);
++
++  group('把手位置', () {
++    testWidgets('handles sit on the edges of the crop rect, not the box', (
++      tester,
++    ) async {
++      // 裁剪框在图片中间：这正是"把手只乘 display.width/height 而忘记加
++      // display.left/top"这个 bug 会暴露的场景（把手会全挤到左上角）
++      await tester.pumpWidget(
++        _wrap(
++          ImageCropOverlay(
++            cropRect: const Rect.fromLTWH(50, 50, 100, 100),
++            sourceSize: sourceSize,
++            boxSize: boxSize,
++            onChanged: (_) {},
++          ),
++        ),
++      );
++
++      // 源图 50..150 → 显示 25..75
++      expect(_center(tester, const Offset(1, 1)), const Offset(75, 75));
++      expect(_center(tester, const Offset(-1, -1)), const Offset(25, 25));
++      expect(_center(tester, const Offset(0, 1)), const Offset(50, 75));
++      expect(_center(tester, const Offset(-1, 0)), const Offset(25, 50));
++      expect(_center(tester, const Offset(1, 0)), const Offset(75, 50));
++    });
++  });
++
++  group('拖动把手改裁剪框', () {
++    testWidgets('dragging the right edge inwards shrinks the crop', (
++      tester,
++    ) async {
++      final result = await _drag(
++        tester,
++        cropRect: fullCrop,
++        start: const Offset(96, 50), // 右边中点，稍微往里一点避免踩到边界
++        delta: const Offset(-1000, 0),
++      );
++
++      expect(result, isNotNull);
++      expect(result!.left, 0, reason: 'the left edge must not move');
++      expect(
++        result.right,
++        ImageCropOverlay.minCropSize,
++        reason: 'the right edge stops at the minimum crop width',
++      );
++    });
++
++    testWidgets('dragging the left edge outwards shrinks the crop', (
++      tester,
++    ) async {
++      final result = await _drag(
++        tester,
++        cropRect: fullCrop,
++        start: const Offset(4, 50),
++        delta: const Offset(1000, 0),
++      );
++
++      expect(result, isNotNull);
++      expect(
++        result!.right,
++        sourceSize.width,
++        reason: 'the right edge stays put',
++      );
++      expect(result.left, sourceSize.width - ImageCropOverlay.minCropSize);
++    });
++
++    testWidgets('dragging the bottom edge upwards shrinks the crop', (
++      tester,
++    ) async {
++      final result = await _drag(
++        tester,
++        cropRect: fullCrop,
++        start: const Offset(50, 96),
++        delta: const Offset(0, -1000),
++      );
++
++      expect(result, isNotNull);
++      expect(result!.top, 0);
++      expect(result.bottom, ImageCropOverlay.minCropSize);
++    });
++
++    testWidgets('the crop cannot grow beyond the image', (tester) async {
++      final result = await _drag(
++        tester,
++        cropRect: fullCrop,
++        start: const Offset(4, 50),
++        delta: const Offset(-1000, 0),
++      );
++
++      expect(result, isNotNull);
++      expect(result!.left, 0, reason: 'clamped to the left edge of the image');
++      expect(result.right, sourceSize.width);
++    });
++  });
++
++  group('拖动裁剪框本身', () {
++    testWidgets('dragging inside the crop moves it without resizing', (
++      tester,
++    ) async {
++      const crop = Rect.fromLTWH(50, 50, 100, 100);
++      final result = await _drag(
++        tester,
++        cropRect: crop,
++        start: const Offset(50, 50), // 显示坐标下的裁剪框中心
++        delta: const Offset(30, 40),
++      );
++
++      expect(result, isNotNull);
++      expect(result!.width, crop.width, reason: 'size must not change');
++      expect(result.height, crop.height);
++      expect(result.left, greaterThan(crop.left), reason: 'moved right');
++      expect(result.top, greaterThan(crop.top), reason: 'moved down');
++    });
++
++    testWidgets('the crop cannot be dragged outside the image', (tester) async {
++      const crop = Rect.fromLTWH(100, 100, 100, 100);
++      final result = await _drag(
++        tester,
++        cropRect: crop,
++        start: const Offset(75, 75), // 显示 50..100 的中心
++        delta: const Offset(1000, 1000),
++      );
++
++      expect(result, isNotNull);
++      expect(result!.left, sourceSize.width - crop.width);
++      expect(result.top, sourceSize.height - crop.height);
++      expect(result.right, lessThanOrEqualTo(sourceSize.width));
++      expect(result.bottom, lessThanOrEqualTo(sourceSize.height));
++    });
++  });
++}
++
++/// 把手中心相对裁剪层左上角的位置（即"显示坐标"）。
++Offset _center(WidgetTester tester, Offset position) {
++  final origin = tester.getTopLeft(find.byType(ImageCropOverlay));
++  return tester.getCenter(find.byKey(ImageCropOverlay.handleKey(position))) -
++      origin;
++}
++
++Future<Rect?> _drag(
++  WidgetTester tester, {
++  required Rect cropRect,
++  required Offset start,
++  required Offset delta,
++}) async {
++  Rect? changed;
++  await tester.pumpWidget(
++    _wrap(
++      ImageCropOverlay(
++        cropRect: cropRect,
++        sourceSize: const Size(200, 200),
++        boxSize: const Size(100, 100),
++        onChanged: (rect) => changed = rect,
++      ),
++    ),
++  );
++
++  final origin = tester.getTopLeft(find.byType(ImageCropOverlay));
++  // 分两步：第一步越过触摸 slop（会被 DragStartBehavior.start 吃掉），
++  // 第二步才是真正被上报的位移。
++  final gesture = await tester.startGesture(origin + start);
++  await gesture.moveBy(const Offset(40, 40));
++  await gesture.moveBy(delta);
++  await gesture.up();
++  await tester.pump();
++
++  return changed;
++}
++
++Widget _wrap(Widget child) => MaterialApp(
++  home: Center(child: SizedBox(width: 100, height: 100, child: child)),
++);

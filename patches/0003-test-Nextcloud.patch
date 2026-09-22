@@ -1,0 +1,43 @@
+From acc06b319ba26daf7497f9844f2936cf4c4dbbd9 Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sat, 19 Sep 2026 12:49:10 +0800
+Subject: [PATCH 03/14] =?UTF-8?q?test:=20=E4=BF=AE=E6=AD=A3=E9=9A=8F=20Nex?=
+ =?UTF-8?q?tcloud=20=E7=A7=BB=E9=99=A4=E8=80=8C=E8=BF=87=E6=97=B6=E7=9A=84?=
+ =?UTF-8?q?=E6=96=AD=E8=A8=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+home_subpage_transition_test 原本断言设置页里存在 Logged out 这句文案，
+它来自 t.login.status.loggedOut，由已被移除的 NextcloudProfile 组件渲染，
+所以 Nextcloud 删除后该断言必然失败。
+
+改用设置页自身的分类标题 General（t.settings.prefCategories.general，
+在设置页只渲染一次）作为已切换到设置子页的标记，保持测试原意。
+
+flutter test 结果：230 通过 / 12 跳过 / 3 失败。剩余 3 个失败均为 Windows
+平台与字体环境问题（glassy_container 缺 Apple 字体、fm_write_stream 的
+相对路径分隔符、sbn_test 的文件句柄占用），这 3 个测试文件与对应源码都未被
+本次改造改动过，且上游 CI 只在 ubuntu 上运行测试，与本项目改造无关。
+---
+ test/home_subpage_transition_test.dart | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/test/home_subpage_transition_test.dart b/test/home_subpage_transition_test.dart
+index 789d6035..504c97ab 100644
+--- a/test/home_subpage_transition_test.dart
++++ b/test/home_subpage_transition_test.dart
+@@ -41,8 +41,12 @@ void main() {
+         await tester.pump();
+         await tester.pump(const Duration(milliseconds: 150));
+ 
++        // 个人自用版：这里原来还断言 find.text('Logged out')，那是
++        // t.login.status.loggedOut，由已被移除的 NextcloudProfile 组件渲染。
++        // 改用设置页自身的分类标题 "General"（t.settings.prefCategories.general）
++        // 作为"已切到设置子页"的标记。
+         expect(
+-          [find.text('Welcome to Saber'), find.text('Logged out')],
++          [find.text('Welcome to Saber'), find.text('General')],
+           [findsOneWidget, findsOneWidget],
+         );
+       });

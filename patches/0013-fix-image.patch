@@ -1,0 +1,428 @@
+From b816334abec60685908d1da0043bb2af6ca03389 Mon Sep 17 00:00:00 2001
+From: Saber Customizer <local@localhost>
+Date: Sun, 20 Sep 2026 16:27:59 +0800
+Subject: [PATCH 13/14] =?UTF-8?q?fix(image):=20=E6=97=8B=E8=BD=AC=E6=94=B9?=
+ =?UTF-8?q?=E6=88=90"=E6=A1=86=E8=B7=9F=E7=9D=80=E5=9B=BE=E4=B8=80?=
+ =?UTF-8?q?=E8=B5=B7=E8=BD=AC"=EF=BC=8C=E4=B8=8D=E5=86=8D=E8=B6=8A?=
+ =?UTF-8?q?=E8=BD=AC=E8=B6=8A=E5=B0=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+反馈：旋转是在裁剪框里转的，图的大小会随旋转变化。
+
+确实是我上一版的设计错了：当时把旋转套在图片内容上，再把旋转后的外接
+矩形按比例缩回固定的格子里 —— 于是转 45 度时图会缩到 71%（正方形），
+而且边框和把手不跟着转，看起来就是"图在框里自转"。
+
+改成动画编辑器那种做法：**图片 + 它的边框和把手作为一个整体绕中心旋转**，
+外层格子按旋转后的外接矩形长大。所以：
+
+- 图、边框、把手一起转，视觉上是一个刚性整体
+- 图本身的绘制尺寸**完全不变**（转多少度都还是那么大）
+- 外层格子跟着外接矩形变大，所以四个角不会被裁掉
+
+布局也顺着重新分了两层"环"，各管一件事：
+- 内环 handleInset（半个把手）：把手框比图片大一圈，保证跨在边框上的
+  半个把手也能点到（第六批那个结论）
+- 外环 handlePadding：给旋转箭头和动作条留可命中的空间
+- 图片内容在 (pad+inset, pad+inset)、把手在把手框里、旋转箭头压在把手框
+  上边缘 —— 旋转时这些都跟着一起转
+
+0 度时逐项验证过绝对位置与改动前一致（内容、边框、把手位置都没动），
+所以 golden 逐张通过；只有动作条因为要待在"旋转后的外接矩形"下方而下移了
+约 44px。
+
+顺带把外接矩形的计算抽成 CanvasImage.rotatedBounds 并加测试，专门守住
+"旋转不改变图片尺寸"这条性质（含 0/90/180/270 度和面积不减）。
+
+写测试时又踩到两个坑，都记在测试注释里：
+- cos/sin 有浮点噪声（sin(pi) 是 1.2e-16 不是 0），尺寸比较必须带容差
+- 不能断言"每个方向都不变小"：2:1 的矩形转 60 度后宽只有 93.3，
+  比原来的 100 还窄。不变量是**面积**不减
+---
+ lib/components/canvas/canvas_image.dart | 214 ++++++++++++++----------
+ test/image_orientation_test.dart        |  47 ++++++
+ 2 files changed, 174 insertions(+), 87 deletions(-)
+
+diff --git a/lib/components/canvas/canvas_image.dart b/lib/components/canvas/canvas_image.dart
+index b2c98692..8003404c 100644
+--- a/lib/components/canvas/canvas_image.dart
++++ b/lib/components/canvas/canvas_image.dart
+@@ -51,9 +51,15 @@ class CanvasImage extends StatefulHookWidget {
+   /// 个人自用版：把手（小圆点）的直径。原来 40，稍放大一点更好按。
+   static const handleSize = 44.0;
+ 
+-  /// 个人自用版：图片格子向外扩出的余量，用来容纳跨在边框上的把手。
++  /// 个人自用版：把手框比图片大出来的余量。
+   ///
+-  /// 必须 >= [handleSize] / 2，否则把手仍有一半落在格子外，那半永远点不到。
++  /// 把手圆心压在图片边缘上，所以它有一半落在图片之外；把手框必须比图片
++  /// 大出至少半个把手，那半边才点得到。
++  static const handleInset = handleSize / 2;
++
++  /// 个人自用版：格子最外面那一圈，给旋转箭头和动作条留出可命中的空间。
++  ///
++  /// 与 [handleInset] 叠加：格子 = 图片 + 2*handleInset + 2*handlePadding。
+   static const handlePadding = 28.0;
+ 
+   /// 个人自用版：判断 [srcRect] 是否真的裁掉了东西。
+@@ -100,6 +106,21 @@ class CanvasImage extends StatefulHookWidget {
+     return snapped == -180 ? 180 : snapped;
+   }
+ 
++  /// 个人自用版：一个 [size] 大小的矩形旋转 [degrees] 度之后的外接矩形。
++  ///
++  /// 外层格子用这个尺寸，所以旋转时**只有格子跟着长大**，图片本身始终保持
++  /// [size] 不变 —— 这就是"旋转不该让图变小"的实现方式。
++  @visibleForTesting
++  static Size rotatedBounds(Size size, double degrees) {
++    final double radians = degrees * pi / 180;
++    final double cosA = cos(radians).abs();
++    final double sinA = sin(radians).abs();
++    return Size(
++      size.width * cosA + size.height * sinA,
++      size.width * sinA + size.height * cosA,
++    );
++  }
++
+   /// 个人自用版：当前是否有图片处于裁剪模式。
+   ///
+   /// 画布（InnerCanvas）监听它，在裁剪时铺一层透明的"点空白处完成裁剪"捕获层。
+@@ -403,34 +424,17 @@ class _CanvasImageState extends State<CanvasImage> {
+             ),
+           );
+ 
+-    // 个人自用版：旋转 + 水平翻转。
++    // 个人自用版：水平翻转。
+     //
+-    // 裁剪模式下**不套用**：裁剪框永远在"未旋转、未翻转"的源图坐标系里，
+-    // 如果这时还套着旋转，用户看到的图和裁剪框就对不上了。
++    // 旋转**不在这里**做：旋转要连图片的边框和把手一起转（否则就是"图在框里
++    // 自转"，看着别扭），所以在外层绕中心转整个把手框 —— 见下面 handleFrame
++    // 的注释。
+     //
+-    // 旋转是绕格子中心转的，转完的外接矩形会大于格子，所以要按比例缩回去，
+-    // 否则四个角会被裁掉（格子外没有绘制区域）。
++    // 裁剪模式下旋转和翻转都不套用：裁剪框永远在"未旋转、未翻转"的源图
++    // 坐标系里，否则用户看到的图和裁剪框对不上。
+     Widget displayImage = imageContent;
+-    if (!_cropping) {
+-      if (widget.image.flipHorizontal) {
+-        displayImage = Transform.scale(scaleX: -1, child: displayImage);
+-      }
+-      final double degrees = widget.image.rotationDegrees;
+-      if (degrees != 0) {
+-        final double radians = degrees * pi / 180;
+-        final double cosA = cos(radians).abs();
+-        final double sinA = sin(radians).abs();
+-        final double boundsWidth = boxWidth * cosA + boxHeight * sinA;
+-        final double boundsHeight = boxWidth * sinA + boxHeight * cosA;
+-        final double fit = min(
+-          boxWidth / boundsWidth,
+-          boxHeight / boundsHeight,
+-        ).clamp(0.0, 1.0);
+-        displayImage = Transform.rotate(
+-          angle: radians,
+-          child: Transform.scale(scale: fit, child: displayImage),
+-        );
+-      }
++    if (!_cropping && widget.image.flipHorizontal) {
++      displayImage = Transform.scale(scaleX: -1, child: displayImage);
+     }
+ 
+     final Widget unpositioned = IgnorePointer(
+@@ -529,62 +533,87 @@ class _CanvasImageState extends State<CanvasImage> {
+         child: unpositioned,
+       );
+     }
+-    // 个人自用版：图片的"格子"比图片本身大一圈，这一圈专门留给把手。
++    // 个人自用版：图片外面套两层"环"，各自解决一件事：
+     //
+-    // 为什么需要：把手画在图片/裁剪框的边上（视觉上跨过边框），但只要格子的边界
+-    // 正好等于图片边界，伸到外面的那一半就**既看得见又点不到** —— Flutter 的
+-    // RenderBox.hitTest 一旦发现点落在自身尺寸之外就直接返回，父级边界之外
+-    // 根本没有命中测试可言。这就是"小圆点总是点不到"的根因：
+-    // 角落把手实际可点区域只有 20×20。
++    // ① 内环 inset：把手圆心压在图片边缘上（视觉上跨过边框）。如果它的父级边界
++    //    正好等于图片边界，伸到外面的那一半就**既看得见又点不到** —— Flutter 的
++    //    RenderBox.hitTest 一旦发现点落在自身尺寸之外就直接返回，父级边界之外
++    //    根本没有命中测试可言。所以把手要放在一个比图片大一圈的"把手框"里。
+     //
+-    // 格子放大 pad 之后，图片内容用 Positioned(left/top: pad) 补回来，
+-    // 所以图片的位置与尺寸和改动前**完全一致**，只是在外面多了一圈可点的余量。
++    // ② 外环 pad：给旋转箭头和动作条留出可命中的空间（它们也在图片框之外）。
++    //
++    // 关键：**图片内容和把手框一起旋转**，外层的格子按旋转后的外接矩形算。
++    // 所以旋转时框跟着图一起转、图本身的大小**不变**，四个角也不会被裁掉。
++    // （早先的版本是"图在固定的框里自转、再按比例缩回框内"，那会让图越转越小。）
++    const double inset = CanvasImage.handleInset;
+     const double pad = CanvasImage.handlePadding;
+ 
+     final bool showResizeHandles = !widget.readOnly && !_cropping;
+ 
++    // 把手框 = 图片 + 两圈 inset
++    final double frameWidth = boxWidth + inset * 2;
++    final double frameHeight = boxHeight + inset * 2;
++
++    // 裁剪模式下不旋转：裁剪框永远在未旋转的源图坐标系里
++    final double degrees = _cropping ? 0 : widget.image.rotationDegrees;
++    final double radians = degrees * pi / 180;
++    // 旋转后的外接矩形：格子跟着它变大，图片本身（frameWidth/Height）不缩放
++    final Size bounds = CanvasImage.rotatedBounds(
++      Size(frameWidth, frameHeight),
++      degrees,
++    );
++    final double boundsWidth = bounds.width;
++    final double boundsHeight = bounds.height;
++
++    final Widget handleFrame = SizedBox(
++      width: frameWidth,
++      height: frameHeight,
++      child: Stack(
++        children: [
++          Positioned(
++            left: inset,
++            top: inset,
++            width: boxWidth,
++            height: boxHeight,
++            child: unpositioned,
++          ),
++
++          // 缩放把手：位置以图片边缘为基准，父级是把手框 → 整圆都可点。
++          // 顶部中间那个位置让给旋转箭头（顶部仍可用两个上角拉伸）。
++          if (showResizeHandles)
++            for (double x = -20; x <= 20; x += 20)
++              for (double y = -20; y <= 20; y += 20)
++                if (x != 0 || y != 0) // ignore (0,0)
++                  if (!(x == 0 && y == -20)) // 让给旋转箭头
++                    _CanvasImageResizeHandle(
++                      active: active,
++                      position: Offset(x, y),
++                      image: widget.image,
++                      parent: this,
++                      afterDrag: () => setState(() {}),
++                    ),
++        ],
++      ),
++    );
++
+     final Widget withActionBar = Stack(
+       clipBehavior: Clip.none,
+       children: [
+-        // 图片内容：位置与尺寸与改动前一致
+-        Positioned(
+-          left: pad,
+-          top: pad,
+-          width: boxWidth,
+-          height: boxHeight,
+-          child: unpositioned,
+-        ),
+-
+-        // 缩放把手：父级是放大后的格子，所以跨在边框外的那一半也能点到。
+-        // 顶部中间那个位置让给旋转箭头（顶部仍可用两个上角拉伸）。
+-        if (showResizeHandles)
+-          for (double x = -20; x <= 20; x += 20)
+-            for (double y = -20; y <= 20; y += 20)
+-              if (x != 0 || y != 0) // ignore (0,0)
+-                if (!(x == 0 && y == -20)) // 让给旋转箭头
+-                  _CanvasImageResizeHandle(
+-                    active: active,
+-                    position: Offset(x, y),
+-                    image: widget.image,
+-                    parent: this,
+-                    afterDrag: () => setState(() {}),
+-                  ),
+-
+-        // 个人自用版：图片上方的旋转箭头，拖动即可自由旋转
+-        if (showResizeHandles)
+-          _CanvasImageRotateHandle(
+-            active: active,
+-            image: widget.image,
+-            onRotateStart: startRotate,
+-            onRotateUpdate: updateRotate,
+-            onRotateEnd: endRotate,
++        // 图片 + 它的边框和把手，整体绕中心旋转
++        Positioned.fill(
++          child: Center(
++            child: degrees == 0
++                ? handleFrame
++                : Transform.rotate(angle: radians, child: handleFrame),
+           ),
++        ),
+ 
+-        // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）
++        // 个人自用版：裁剪交互层（框外压暗 + 拖动裁剪框）。
++        // 裁剪时 degrees 恒为 0，所以按"图片 + pad"摆放就能和图片对齐。
+         if (_cropping)
+           Positioned(
+-            left: 0,
+-            top: 0,
++            left: inset,
++            top: inset,
+             width: boxWidth + pad * 2,
+             height: boxHeight + pad * 2,
+             child: ImageCropOverlay(
+@@ -596,12 +625,23 @@ class _CanvasImageState extends State<CanvasImage> {
+             ),
+           ),
+ 
++        // 个人自用版：图片上方的旋转箭头（不跟着图片转，永远在正上方）
++        if (showResizeHandles)
++          _CanvasImageRotateHandle(
++            active: active,
++            image: widget.image,
++            frameWidth: frameWidth,
++            onRotateStart: startRotate,
++            onRotateUpdate: updateRotate,
++            onRotateEnd: endRotate,
++          ),
++
+         // 个人自用版：选中时在图片**下方**浮出动作条
+         if (active && !widget.readOnly && !widget.isBackground)
+           Positioned(
+             left: 0,
+             right: 0,
+-            top: pad + boxHeight + 8,
++            top: pad + boundsHeight + 8,
+             child: DeferPointer(
+               paintOnTop: true,
+               child: Center(
+@@ -654,15 +694,12 @@ class _CanvasImageState extends State<CanvasImage> {
+           : const Duration(milliseconds: 300),
+       curve: Curves.fastLinearToSlowEaseIn,
+ 
+-      // 格子往外扩 pad；图片内容在上面补回了 pad，所以视觉位置不变
+-      left: widget.image.dstRect.left - pad,
+-      top: widget.image.dstRect.top - pad,
+-      width:
+-          max(widget.image.dstRect.width, CanvasImage.minInteractiveSize) +
+-          pad * 2,
+-      height:
+-          max(widget.image.dstRect.height, CanvasImage.minInteractiveSize) +
+-          pad * 2,
++      // 外层格子 = 旋转后的外接矩形 + pad，并且**以图片中心为中心**，
++      // 这样旋转时格子会对称地长大/缩小，图片本身的位置和大小都不动
++      left: widget.image.dstRect.center.dx - (boundsWidth + pad * 2) / 2,
++      top: widget.image.dstRect.center.dy - (boundsHeight + pad * 2) / 2,
++      width: boundsWidth + pad * 2,
++      height: boundsHeight + pad * 2,
+ 
+       child: withActionBar,
+     );
+@@ -736,12 +773,14 @@ class _CanvasImageResizeHandle extends StatelessWidget {
+     );
+     const double half = CanvasImage.handleSize / 2;
+     return Positioned(
++      // 父级是"把手框"，图片从 handleInset 处开始，所以这里加的是 handleInset
++      // （不是最外层那圈 handlePadding）
+       left:
+-          CanvasImage.handlePadding +
++          CanvasImage.handleInset +
+           (position.dx.sign + 1) / 2 * boxWidth -
+           half,
+       top:
+-          CanvasImage.handlePadding +
++          CanvasImage.handleInset +
+           (position.dy.sign + 1) / 2 * boxHeight -
+           half,
+       child: DeferPointer(
+@@ -1018,6 +1057,7 @@ class _CanvasImageRotateHandle extends StatelessWidget {
+   const new({
+     required this.active,
+     required this.image,
++    required this.frameWidth,
+     required this.onRotateStart,
+     required this.onRotateUpdate,
+     required this.onRotateEnd,
+@@ -1025,6 +1065,9 @@ class _CanvasImageRotateHandle extends StatelessWidget {
+ 
+   final bool active;
+   final EditorImage image;
++
++  /// 把手框的宽度（图片 + 两圈 handleInset）。
++  final double frameWidth;
+   final void Function(Offset globalPosition) onRotateStart;
+   final void Function(Offset globalPosition) onRotateUpdate;
+   final VoidCallback onRotateEnd;
+@@ -1032,13 +1075,10 @@ class _CanvasImageRotateHandle extends StatelessWidget {
+   @override
+   Widget build(BuildContext context) {
+     final colorScheme = ColorScheme.of(context);
+-    final double boxWidth = max(
+-      image.dstRect.width,
+-      CanvasImage.minInteractiveSize,
+-    );
+     const double size = CanvasImage.handleSize;
+     return Positioned(
+-      left: CanvasImage.handlePadding + boxWidth / 2 - size / 2,
++      // 压在"把手框"的上边缘（也就是图片上方 handleInset 处）水平居中
++      left: CanvasImage.handlePadding + frameWidth / 2 - size / 2,
+       top: CanvasImage.handlePadding - size / 2,
+       child: DeferPointer(
+         paintOnTop: true,
+diff --git a/test/image_orientation_test.dart b/test/image_orientation_test.dart
+index 48340edc..b7ba0f7c 100644
+--- a/test/image_orientation_test.dart
++++ b/test/image_orientation_test.dart
+@@ -13,6 +13,12 @@ import 'package:saber/components/canvas/image/editor_image.dart';
+ /// 2. 旋转角度的吸附规则（否则手动几乎转不回正，或者反过来吸得太多、
+ ///    自由旋转变得不自由）
+ void main() {
++  /// 尺寸比较带容差：cos/sin 会带浮点噪声。
++  void expectSize(Size actual, Size expected) {
++    expect(actual.width, closeTo(expected.width, 0.01));
++    expect(actual.height, closeTo(expected.height, 0.01));
++  }
++
+   group('normaliseRotationDegrees', () {
+     test('free angles are kept as they are', () {
+       expect(CanvasImage.normaliseRotationDegrees(37), 37);
+@@ -41,6 +47,47 @@ void main() {
+     });
+   });
+ 
++  group('rotatedBounds', () {
++    // "旋转不该让图变小"依赖的性质：格子按外接矩形长大，
++    // 图片本身的尺寸（传进去的 size）始终不变。
++    const size = Size(100, 50);
++
++    test('no rotation leaves the size alone', () {
++      // cos/sin 带浮点噪声（sin(π) 是 1.2e-16 而不是 0），所以用容差比
++      expectSize(CanvasImage.rotatedBounds(size, 0.0), size);
++      expectSize(CanvasImage.rotatedBounds(size, 180.0), size);
++      expectSize(CanvasImage.rotatedBounds(size, 360.0), size);
++    });
++
++    test('a quarter turn swaps width and height', () {
++      expectSize(CanvasImage.rotatedBounds(size, 90.0), const Size(50, 100));
++      expectSize(CanvasImage.rotatedBounds(size, -90.0), const Size(50, 100));
++      expectSize(CanvasImage.rotatedBounds(size, 270.0), const Size(50, 100));
++    });
++
++    test('45 degrees gives square-ish bounds', () {
++      final bounds = CanvasImage.rotatedBounds(size, 45.0);
++      // (100+50)/√2
++      expect(bounds.width, closeTo(106.07, 0.01));
++      expect(bounds.height, closeTo(106.07, 0.01));
++    });
++
++    test('the bounds never lose area', () {
++      // 注意不能断言"每个方向都不变小"：2:1 的矩形转 60° 之后宽只有 93.3，
++      // 比原来的 100 还窄（另一条边变长了）。不变量是**面积**不减，
++      // 以及图片本身始终按原尺寸绘制（这一点由调用方保证）。
++      const originalArea = 100 * 50;
++      for (final degrees in <double>[0, 3, 17, 45, 60, 89, 90, 137, 180, 271.5]) {
++        final bounds = CanvasImage.rotatedBounds(size, degrees);
++        expect(
++          bounds.width * bounds.height,
++          greaterThanOrEqualTo(originalArea - 0.01),
++          reason: '$degrees degrees should not lose area',
++        );
++      }
++    });
++  });
++
+   group('orientation persistence', () {
+     final bytes = Uint8List.fromList([1, 2, 3, 4]);
+ 
