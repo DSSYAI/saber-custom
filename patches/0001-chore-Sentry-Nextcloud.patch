@@ -244,7 +244,7 @@ index 00000000..77c0694c
 @@ -0,0 +1,764 @@
 +# Saber v1.36.1 个人自用改造候选清单（Android / 联想小新 2025 Pro 配套平板）
 +
-+> **审计对象**：`E:\agent\Fold for DSH\Saber`（Saber v1.36.1+136010，`lib/data/version.dart` 中 `buildName = '1.36.1'`、`buildNumber = 136010`）
++> **审计对象**：`本地 Saber 检出目录`（Saber v1.36.1+136010，`lib/data/version.dart` 中 `buildName = '1.36.1'`、`buildNumber = 136010`）
 +> **审计方式**：逐文件阅读 `lib/` 全部 192 个 Dart 文件、`pubspec.yaml`、`android/` 构建配置、`packages/sbn`、`packages/onyxsdk_pen`、`patches/`、`test/` 中的相关测试、`.github/workflows/android.yml`。文中所有行号均为实测（`(Get-Content file).Count`），所有"引用点"均为实际 grep 结果。
 +> **约定**：不确定的信息一律标注 **未验证**。涉及"删掉会不会变小/变快"的具体数值，若无实测一律标注 **未验证**。
 +> **当前 checkout 的重要事实**：这是**完整版（非 FOSS 版）**源码 —— `lib/data/sentry/sentry_init.dart` 是真实的 Sentry 初始化实现，另一个 `_sentry_init_foss.dart` 只是 FOSS 补丁脚本在构建时替换用的备用文件（见 `patches/pre/remove_proprietary_dependencies.sh`）。
