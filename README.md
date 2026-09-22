@@ -5,6 +5,8 @@
 
 本仓库**不是完整源码**，而是**补丁集**：`patches/` 里的 14 个补丁用 `git format-patch` 从上游 tag `v1.36.1` 导出，可逐条复现。
 
+> **不想自己编译？** [Releases](https://github.com/DSSYAI/saber-custom/releases) 里有 `v1.36.1-custom.1`，附 arm64 的 `Saber-arm64-v1.36.1.apk`（46.33 MB，含 SHA-256）。装之前请先读下面的「安装前必读」。
+
 > 许可：**GPL-3.0**（沿用上游许可），见 [LICENSE](LICENSE)。再分发请保留许可与上游署名。
 
 ## 这 14 个补丁在做什么
