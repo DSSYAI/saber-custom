@@ -112,6 +112,12 @@ Sentry 遥测与崩溃上报、更新检查、赞助/隐私外链、Nextcloud �
 这 14 个提交的作者字段当时写的是占位名 `Saber Customizer <local@localhost>`。
 若要把改动归到某个 GitHub 账号名下，需要重写提交作者——那会**改变提交哈希**，`patches/` 里的文件名与哈希对照随之失效，需重新导出。
 
+## 关于补丁的完整性
+
+`patches/` 是 `git format-patch` 的逐字导出，**只有两处例外**：`0001` 里 `customization-candidates.md` 正文的一行、以及 `0002` 提交信息里的构建产物路径，原本是作者本机的绝对路径，已替换为占位/相对路径。
+
+替换后做过验证：在一个干净的 `v1.36.1` 检出上按序 `git am` 全部 14 个补丁，**全部干净应用**；得到的树与作者本地树**只差这一行**（`git diff --stat` 显示 1 file changed），两侧提交总数一致（4298）。
+
 ## 构建环境（作者当时使用）
 
 Flutter 3.47.4 ／ JDK 21 (Temurin) ／ Android SDK platform 37.0 ＋ build-tools 37.0.0 ／ NDK 28.2.13676358 ／ Gradle 9.5.0。
