@@ -1,0 +1,24 @@
+# 本地杂物 —— 不该进仓库的东西
+Thumbs.db
+Desktop.ini
+desktop.ini
+~$*
+*.tmp
+*.bak
+*.log
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 压缩包（确实要发布时再单独确认）
+*.zip
+*.7z
+*.rar
